@@ -1866,6 +1866,7 @@ class HifiShifterGUI(QMainWindow):
 
     def load_vocalshifter_project(self, file_path):
         """加载并解析VocalShifter工程文件"""
+        import locale
         import struct
         try:
             self.status_label.setText(i18n.get("status.loading_vocalshifter_project"))
@@ -1941,7 +1942,7 @@ class HifiShifterGUI(QMainWindow):
                             track_name_bytes = track_name_bytes[:null_pos]
                         
                         # 解码为系统默认编码
-                        track_name = track_name_bytes.decode(sys.getdefaultencoding())
+                        track_name = track_name_bytes.decode(locale.getpreferredencoding())
                         
                         # 音量倍率 (偏移64字节)
                         volume = struct.unpack('<d', trkp_data[64:72])[0]
@@ -1981,7 +1982,7 @@ class HifiShifterGUI(QMainWindow):
                             path_bytes.extend(byte)
                         
                         # 解码为系统默认编码
-                        file_path_str = path_bytes.decode(sys.getdefaultencoding())
+                        file_path_str = path_bytes.decode(locale.getpreferredencoding())
                         
                         # 解析轨道索引 (偏移0x108)
                         track_index = struct.unpack('<I', itmp_data[0x108:0x10C])[0]
