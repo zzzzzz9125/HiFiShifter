@@ -60,6 +60,13 @@ pip install PyQt6 pyqtgraph sounddevice numpy scipy torch torchaudio pyyaml
 | **Redo**                      | Ctrl + Y                |
 | **Toggle Mode (Edit/Select)** | Tab                     |
 
+## Recent Updates
+
+- **UI Beautification**: Fully optimized UI themes, supporting Dark/Light mode switching, and refined widget styles.
+- **Visual Enhancements**: Optimized the display of pitch curves, selection boxes, and cursors to ensure clarity on different backgrounds.
+- **Control Optimization**: Improved the track control area, changing the BGM switch to a more intuitive button style, and beautifying volume sliders and numeric input boxes.
+- **Icon Support**: Added application icon loading functionality.
+
 ## Known Issues
 
 There are currently many issues, such as the inability to change volume during playback and a high probability of freezing when importing long audio files.

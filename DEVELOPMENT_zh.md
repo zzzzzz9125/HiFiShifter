@@ -16,6 +16,7 @@ HifiShifter/
 │   ├── audio_processor.py  # 音频处理与模型推理核心
 │   ├── config_manager.py   # 配置与国际化管理
 │   ├── main_window.py      # 主窗口 GUI 逻辑
+│   ├── theme.py            # UI 主题定义与样式管理
 │   ├── timeline.py         # 时间轴与轨道管理
 │   ├── track.py            # 音轨数据模型
 │   └── widgets.py          # 自定义 UI 组件 (PyQtGraph)
@@ -61,6 +62,13 @@ HifiShifter 采用 Model-View-Controller (MVC) 的变体架构，实现了数据
     1. 在 `assets/lang/` 下新建 `xx_XX.json`。
     2. 复制 `en_US.json` 的内容并翻译所有 Value。
     3. 重启软件并在设置中选择新语言。
+
+### 2.4 UI 主题系统 (`theme.py`)
+项目实现了基于 `QPalette` 和 `QSS` (Qt Style Sheets) 的双主题系统（深色/浅色模式）。
+*   **主题定义**: `theme.py` 中的 `THEMES` 字典定义了不同模式下的颜色方案，包括窗口背景、文本颜色、高亮色等。
+*   **样式表 (QSS)**: 针对 `QComboBox`、`QSpinBox`、`QMenu` 等控件定制了 CSS 样式的外观，去除了原生边框并统一了视觉风格。
+*   **绘图样式**: `PyQtGraph` 的绘图元素（如 F0 曲线、网格线、选择框）使用独立的 Pen/Brush 配置，确保在深色和浅色背景下均有良好的对比度。
+*   **动态切换**: `MainWindow` 监听主题切换信号，实时更新 `QApplication` 的 Palette 和所有绘图组件的颜色配置。
 
 ## 3. 开发指南
 
