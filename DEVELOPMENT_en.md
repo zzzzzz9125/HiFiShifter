@@ -16,6 +16,7 @@ HifiShifter/
 │   ├── audio_processor.py  # Audio processing & model inference core
 │   ├── config_manager.py   # Configuration & i18n management
 │   ├── main_window.py      # Main Window GUI logic
+│   ├── theme.py            # UI theme definition & style management
 │   ├── timeline.py         # Timeline & Track management
 │   ├── track.py            # Track data model
 │   └── widgets.py          # Custom UI widgets (PyQtGraph)
@@ -61,6 +62,13 @@ The project has built-in lightweight internationalization (i18n) support.
     1. Create a new `xx_XX.json` in `assets/lang/`.
     2. Copy the content of `en_US.json` and translate all Values.
     3. Restart the software and select the new language in Settings.
+
+### 2.4 UI Theme System (`theme.py`)
+The project implements a dual-theme system (Dark/Light mode) based on `QPalette` and `QSS` (Qt Style Sheets).
+*   **Theme Definition**: The `THEMES` dictionary in `theme.py` defines color schemes for different modes, including window background, text color, highlight color, etc.
+*   **Style Sheets (QSS)**: Customized CSS-like appearance for widgets such as `QComboBox`, `QSpinBox`, and `QMenu`, removing native borders and unifying visual styles.
+*   **Drawing Styles**: `PyQtGraph` drawing elements (e.g., F0 curves, grid lines, selection boxes) use independent Pen/Brush configurations to ensure good contrast on both dark and light backgrounds.
+*   **Dynamic Switching**: `MainWindow` listens for theme switching signals and updates `QApplication`'s Palette and all drawing component color configurations in real-time.
 
 ## 3. Development Guide
 

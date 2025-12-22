@@ -3,14 +3,21 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPen, QColor, QPainter, QPainterPath, QPolygonF, QFont, QBrush
 from PyQt6.QtCore import Qt, QRectF, QPointF
 import pyqtgraph as pg
+from . import theme
 
 class PlaybackCursorItem(pg.GraphicsObject):
     def __init__(self):
         super().__init__()
-        self.setZValue(1000) # Always on top
-        self.pen = pg.mkPen(color='#FFD700', width=1) # Gold color, width 1
+        self.setZValue(2000) # Always on top, above everything
+        self.update_theme()
+        
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        color = current_theme['piano_roll']['cursor']
+        self.pen = pg.mkPen(color=color, width=2)
         self.pen.setCosmetic(True)
-        self.brush = pg.mkBrush(color='#FFD700')
+        self.brush = pg.mkBrush(color=color)
+        self.update()
         
     def setValue(self, value):
         self.setPos(value, 0)
@@ -57,6 +64,21 @@ class MusicGridItem(pg.GraphicsObject):
         self.parent_gui = parent_gui
         self.grid_resolution = 4 # 1/4 note (beat) by default
         self.setZValue(-10) # Behind everything
+        self.update_theme()
+        
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        colors = current_theme['piano_roll']
+        
+        self.bar_pen = QPen(QColor(*colors['grid_bar']), 1)
+        self.bar_pen.setCosmetic(True)
+        
+        self.beat_pen = QPen(QColor(*colors['grid_beat']), 1)
+        self.beat_pen.setCosmetic(True)
+        
+        self.sub_pen = QPen(QColor(*colors['grid_sub']), 1)
+        self.sub_pen.setCosmetic(True)
+        self.update()
         
     def set_resolution(self, res):
         self.grid_resolution = res
@@ -139,14 +161,6 @@ class MusicGridItem(pg.GraphicsObject):
              # Still too many lines, just draw bars or nothing
              return
         
-        # Pens
-        bar_pen = QPen(QColor(180, 180, 180, 150), 1) # Brighter for visibility
-        bar_pen.setCosmetic(True)
-        beat_pen = QPen(QColor(100, 100, 100, 100), 1)   # Brighter for visibility
-        beat_pen.setCosmetic(True)
-        sub_pen = QPen(QColor(70, 70, 70, 80), 1) # Brighter for visibility
-        sub_pen.setCosmetic(True)
-        
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         
         for i in range(start_idx, end_idx):
@@ -159,11 +173,11 @@ class MusicGridItem(pg.GraphicsObject):
             # Check if it's a bar line
             # Use a small epsilon for float comparison
             if abs(total_beats % beats_per_bar) < 0.001:
-                p.setPen(bar_pen)
+                p.setPen(self.bar_pen)
             elif abs(total_beats % 1.0) < 0.001:
-                p.setPen(beat_pen)
+                p.setPen(self.beat_pen)
             else:
-                p.setPen(sub_pen)
+                p.setPen(self.sub_pen)
                 
             p.drawLine(QPointF(x, top), QPointF(x, bottom))
 
@@ -171,6 +185,17 @@ class PitchGridItem(pg.GraphicsObject):
     def __init__(self):
         super().__init__()
         self.setZValue(-20) # Behind everything, even MusicGridItem
+        self.update_theme()
+        
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        colors = current_theme['piano_roll']
+        
+        self.white_key_pen = QPen(QColor(*colors['white_key_pen']), 1)
+        self.white_key_pen.setCosmetic(True)
+        
+        self.black_key_brush = QBrush(QColor(*colors['black_key']))
+        self.update()
         
     def boundingRect(self):
         return QRectF(0, -10000, 10000000, 20000)
@@ -192,12 +217,6 @@ class PitchGridItem(pg.GraphicsObject):
         start_y = int(np.floor(bottom))
         end_y = int(np.ceil(top))
         
-        # Pens
-        white_key_pen = QPen(QColor(60, 60, 60, 50), 1)
-        white_key_pen.setCosmetic(True)
-        
-        black_key_brush = QBrush(QColor(30, 30, 30, 100))
-        
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         
         for y in range(start_y, end_y + 1):
@@ -210,13 +229,13 @@ class PitchGridItem(pg.GraphicsObject):
             
             if is_black:
                 # Draw background strip for black key
-                p.fillRect(QRectF(left, y, right - left, 1), black_key_brush)
+                p.fillRect(QRectF(left, y, right - left, 1), self.black_key_brush)
                 # Draw thinner line? Or just the background is enough distinction
                 # User asked for "black key slightly thinner" - maybe visually thinner line or darker background
                 # Let's use darker background as implemented above.
             
             # Draw grid line (bottom of the key)
-            p.setPen(white_key_pen)
+            p.setPen(self.white_key_pen)
             p.drawLine(QPointF(left, y), QPointF(right, y))
 
 class CustomViewBox(pg.ViewBox):
@@ -401,12 +420,17 @@ class BPMAxis(pg.AxisItem):
             
             # Draw Beat
             p.setFont(font_beat)
-            p.setPen(QColor(200, 200, 200))
+            current_theme = theme.get_current_theme()
+            fg_color = QColor(current_theme['graph']['foreground'])
+            p.setPen(fg_color)
             p.drawText(QRectF(x_pixel - 30, y - 35, 60, 15), Qt.AlignmentFlag.AlignCenter, label_beat)
             
             # Draw Time
             p.setFont(font_time)
-            p.setPen(QColor(150, 150, 150))
+            # Use slightly dimmer color for time
+            dim_color = QColor(fg_color)
+            dim_color.setAlpha(180)
+            p.setPen(dim_color)
             p.drawText(QRectF(x_pixel - 30, y - 18, 60, 12), Qt.AlignmentFlag.AlignCenter, label_time)
             
             # Draw small tick mark

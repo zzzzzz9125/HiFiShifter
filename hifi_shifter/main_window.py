@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QMessageBox, QComboBox, QDoubleSpinBox, QSpinBox,
                              QButtonGroup, QSplitter, QScrollBar, QGraphicsRectItem,
-                             QProgressBar)
-from PyQt6.QtGui import QAction, QKeySequence, QPen, QColor, QBrush, QShortcut, QActionGroup
+                             QProgressBar, QAbstractSpinBox)
+from PyQt6.QtGui import QAction, QKeySequence, QPen, QColor, QBrush, QShortcut, QActionGroup, QIcon
 from PyQt6.QtCore import Qt, QTimer, QRectF
 import pyqtgraph as pg
 
@@ -23,6 +23,8 @@ from .track import Track
 from .audio_processor import AudioProcessor
 # Import Config Manager
 from . import config_manager
+# Import Theme
+from . import theme
 # Import I18n
 from utils.i18n import i18n
 
@@ -41,6 +43,18 @@ class HifiShifterGUI(QMainWindow):
         
         self.setWindowTitle(i18n.get("app.title"))
         self.resize(1200, 800)
+        
+        # Set Window Icon
+        assets_dir = os.path.join(root_dir, 'assets')
+        icon_path = os.path.join(assets_dir, 'icon.png')
+        if not os.path.exists(icon_path):
+             icon_path = os.path.join(assets_dir, 'icon.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # Apply Theme
+        current_theme_name = config_manager.get_theme()
+        theme.apply_theme(QApplication.instance(), current_theme_name)
         
         # Initialize Audio Processor
         self.processor = AudioProcessor()
@@ -145,6 +159,13 @@ class HifiShifterGUI(QMainWindow):
         paste_vocalshifter_action.triggered.connect(self.paste_vocalshifter_clipboard_data)
         edit_menu.addAction(paste_vocalshifter_action)
 
+        # View Menu
+        view_menu = menu_bar.addMenu(i18n.get("menu.view"))
+        
+        toggle_theme_action = QAction(i18n.get("menu.view.toggle_theme"), self)
+        toggle_theme_action.triggered.connect(self.toggle_theme)
+        view_menu.addAction(toggle_theme_action)
+
         # Playback Menu
         play_menu = menu_bar.addMenu(i18n.get("menu.playback"))
         
@@ -189,6 +210,26 @@ class HifiShifterGUI(QMainWindow):
         lang_group.addAction(en_action)
         lang_group.setExclusive(True)
 
+    def toggle_theme(self):
+        current = config_manager.get_theme()
+        new_theme = 'light' if current == 'dark' else 'dark'
+        config_manager.set_theme(new_theme)
+        theme_data = theme.apply_theme(QApplication.instance(), new_theme)
+        
+        # Update Plot Widget
+        self.plot_widget.setBackground(theme_data['graph']['background'])
+        self.plot_widget.showGrid(x=False, y=True, alpha=theme_data['graph'].get('grid_alpha', 0.5))
+        self.music_grid.update_theme()
+        
+        # Update Waveform Color
+        self.update_plot()
+        
+        # Update Timeline Panel
+        if hasattr(self, 'timeline_panel'):
+            self.timeline_panel.update_theme()
+            
+        QMessageBox.information(self, i18n.get("msg.restart_required"), i18n.get("msg.restart_content"))
+
     def change_language(self, lang_code):
         if lang_code == i18n.current_lang:
             return
@@ -224,6 +265,7 @@ class HifiShifterGUI(QMainWindow):
         self.bpm_spin.setRange(10, 300)
         self.bpm_spin.setValue(120)
         self.bpm_spin.setPrefix(i18n.get("label.bpm") + ": ")
+        self.bpm_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.bpm_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus) # Allow typing but not tab focus
         self.bpm_spin.valueChanged.connect(self.on_bpm_changed)
 
@@ -232,6 +274,7 @@ class HifiShifterGUI(QMainWindow):
         self.beats_spin.setValue(4)
         self.beats_spin.setPrefix(i18n.get("label.time_sig") + ": ")
         self.beats_spin.setSuffix(" / 4")
+        self.beats_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.beats_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.beats_spin.valueChanged.connect(self.on_beats_changed)
 
@@ -273,6 +316,13 @@ class HifiShifterGUI(QMainWindow):
         self.plot_layout = QHBoxLayout(self.plot_container)
         self.plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_layout.setSpacing(0)
+        
+        # Container for Plot Widget to apply rounded corners
+        self.plot_container_widget = QWidget()
+        self.plot_container_widget.setStyleSheet("border-radius: 10px;")
+        plot_container_layout = QVBoxLayout(self.plot_container_widget)
+        plot_container_layout.setContentsMargins(0, 0, 0, 0)
+        plot_container_layout.setSpacing(0)
 
         self.plot_widget = pg.PlotWidget(
             viewBox=CustomViewBox(self), 
@@ -282,6 +332,8 @@ class HifiShifterGUI(QMainWindow):
                 'bottom': pg.AxisItem(orientation='bottom') # Standard axis, will be hidden
             }
         )
+        
+        plot_container_layout.addWidget(self.plot_widget)
         
         # Set fixed width for left axis to align with track controls
         # self.plot_widget.getAxis('left').setWidth(CONTROL_PANEL_WIDTH)
@@ -295,11 +347,11 @@ class HifiShifterGUI(QMainWindow):
         self.timeline_panel.ruler_plot.plotItem.vb.disableAutoRange()
         self.timeline_panel.ruler_plot.plotItem.hideButtons() # Hide the "A" button
         
-        self.plot_widget.setBackground('#2b2b2b')
+        current_theme = theme.get_current_theme()
+        self.plot_widget.setBackground(current_theme['graph']['background'])
         self.plot_widget.setLabel('left', i18n.get("label.pitch"))
         # Disable default X grid, keep Y grid
-        self.plot_widget.showGrid(x=False, y=True, alpha=0.5)
-        self.plot_widget.getAxis('left').setGrid(128)
+        self.plot_widget.showGrid(x=False, y=True, alpha=current_theme['graph'].get('grid_alpha', 0.5))
         self.plot_widget.setMouseEnabled(x=True, y=True)
         
         # Add Custom Music Grid
@@ -321,7 +373,7 @@ class HifiShifterGUI(QMainWindow):
         self.plot_scrollbar.setRange(0, 100) # Will be updated dynamically
         self.plot_scrollbar.valueChanged.connect(self.on_plot_scroll)
         
-        self.plot_layout.addWidget(self.plot_widget)
+        self.plot_layout.addWidget(self.plot_container_widget)
         self.plot_layout.addWidget(self.plot_scrollbar)
         
         splitter.addWidget(self.plot_container)
@@ -367,6 +419,7 @@ class HifiShifterGUI(QMainWindow):
         # Selection Box
         self.selection_box_item = QGraphicsRectItem()
         # Use cosmetic pen to ensure visibility at any zoom level
+        # Initial colors, will be updated by update_plot or theme change
         pen = pg.mkPen(color=(255, 255, 255), width=1, style=Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
         self.selection_box_item.setPen(pen)
@@ -406,6 +459,9 @@ class HifiShifterGUI(QMainWindow):
         self.progress_bar.setFixedSize(200, 15) # Fix size
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
+
+        # Set initial cursor and status text
+        self.on_mode_changed(self.mode_combo.currentIndex())
         status_layout.addStretch()
 
     def on_grid_changed(self, index):
@@ -1220,6 +1276,17 @@ class HifiShifterGUI(QMainWindow):
 
     def update_plot(self):
         track = self.current_track
+        
+        # Update Selection Box Theme
+        current_theme = theme.get_current_theme()
+        sel_pen_color = current_theme['piano_roll'].get('selection_pen', (255, 255, 255, 200))
+        sel_brush_color = current_theme['piano_roll'].get('selection_brush', (255, 255, 255, 50))
+        
+        pen = pg.mkPen(color=sel_pen_color, width=1, style=Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.selection_box_item.setPen(pen)
+        self.selection_box_item.setBrush(QBrush(QColor(*sel_brush_color)))
+
         if not track:
             self.waveform_curve.clear()
             self.f0_orig_curve_item.clear()
@@ -1237,8 +1304,13 @@ class HifiShifterGUI(QMainWindow):
             # Use waveform_view (Y range -1 to 1)
             # Scale to fit nicely in background
             self.waveform_curve.setData(x_ds, audio_ds * 0.8) 
-            self.waveform_curve.setPen(pg.mkPen(color=(255, 255, 255, 100), width=1))
-            self.waveform_curve.setBrush(pg.mkBrush(color=(255, 255, 255, 30)))
+            
+            current_theme = theme.get_current_theme()
+            pen_color = current_theme['graph'].get('waveform_pen', (255, 255, 255, 100))
+            brush_color = current_theme['graph'].get('waveform_brush', (255, 255, 255, 30))
+            
+            self.waveform_curve.setPen(pg.mkPen(color=pen_color, width=1))
+            self.waveform_curve.setBrush(pg.mkBrush(color=brush_color))
             self.waveform_curve.setFillLevel(0)
         else:
             self.waveform_curve.clear()
@@ -1247,13 +1319,20 @@ class HifiShifterGUI(QMainWindow):
             # Create x axis for F0
             x_f0 = np.arange(len(track.f0_original)) + track.start_frame if track.f0_original is not None else None
             
+            current_theme = theme.get_current_theme()
+            f0_orig_pen = current_theme['graph'].get('f0_orig_pen', (255, 255, 255, 80))
+            f0_pen = current_theme['graph'].get('f0_pen', '#00ff00')
+            f0_selected_pen = current_theme['graph'].get('f0_selected_pen', '#0099ff')
+            
             if track.f0_original is not None:
                 self.f0_orig_curve_item.setData(x_f0, track.f0_original, connect="finite")
+                self.f0_orig_curve_item.setPen(pg.mkPen(color=f0_orig_pen, width=2, style=Qt.PenStyle.DashLine))
             else:
                 self.f0_orig_curve_item.clear()
 
             if track.f0_edited is not None:
                 self.f0_curve_item.setData(x_f0, track.f0_edited, connect="finite")
+                self.f0_curve_item.setPen(pg.mkPen(color=f0_pen, width=3))
                 
                 # Update Selection Curve
                 if self.selection_mask is not None and len(self.selection_mask) == len(track.f0_edited):
@@ -1261,6 +1340,7 @@ class HifiShifterGUI(QMainWindow):
                     selected_f0 = track.f0_edited.copy()
                     selected_f0[~self.selection_mask] = np.nan
                     self.f0_selected_curve_item.setData(x_f0, selected_f0, connect="finite")
+                    self.f0_selected_curve_item.setPen(pg.mkPen(color=f0_selected_pen, width=3))
                 else:
                     self.f0_selected_curve_item.clear()
             else:
