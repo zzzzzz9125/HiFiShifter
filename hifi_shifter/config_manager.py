@@ -45,3 +45,14 @@ def set_language(lang_code):
     config = load_config()
     config['language'] = lang_code
     save_config(config)
+
+def get_theme():
+    """Get the theme name from config."""
+    config = load_config()
+    return config.get('theme', 'dark')
+
+def set_theme(theme_name):
+    """Set the theme name in config."""
+    config = load_config()
+    config['theme'] = theme_name
+    save_config(config)

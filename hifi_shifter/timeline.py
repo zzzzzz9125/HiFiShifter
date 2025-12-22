@@ -3,10 +3,12 @@ from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPointF, QSize, QEvent
 from PyQt6.QtGui import QColor, QBrush, QPen, QFont, QPainter, QPainterPath, QLinearGradient, QDragEnterEvent, QDropEvent, QAction, QPicture
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
                              QScrollArea, QSizePolicy, QMenu, QSplitter, QFrame, 
-                             QCheckBox, QSlider, QGridLayout, QStyle, QApplication)
+                             QCheckBox, QSlider, QGridLayout, QStyle, QApplication, QGraphicsItem)
 import numpy as np
+import base64
 from utils.i18n import i18n
 from .widgets import BPMAxis, PlaybackCursorItem, MusicGridItem, PitchGridItem
+from . import theme
 
 # Constants
 TRACK_HEIGHT_MIN = 60
@@ -115,19 +117,33 @@ class AudioBlockItem(pg.GraphicsObject):
         
         rect = QRectF(0, 0, width, height)
         
-        # Colors
-        if self.track.track_type == 'vocal':
-            bg_color = QColor(40, 60, 100, 200)
-            wave_color = QColor(100, 180, 255, 255)
-            border_color = QColor(100, 150, 255)
+        # Colors from Theme
+        current_theme = theme.get_current_theme()
+        block_theme = current_theme.get('audio_block', {})
+        
+        type_key = 'vocal' if self.track.track_type == 'vocal' else 'bgm'
+        colors = block_theme.get(type_key, {})
+        
+        # Default fallbacks if theme is missing keys (e.g. old theme dict)
+        if not colors:
+            if self.track.track_type == 'vocal':
+                bg_color = QColor(40, 60, 100, 200)
+                wave_color = QColor(100, 180, 255, 255)
+                border_color = QColor(100, 150, 255)
+            else:
+                bg_color = QColor(40, 80, 40, 200)
+                wave_color = QColor(150, 255, 100, 255)
+                border_color = QColor(150, 255, 100)
         else:
-            bg_color = QColor(40, 80, 40, 200)
-            wave_color = QColor(150, 255, 100, 255)
-            border_color = QColor(150, 255, 100)
+            bg_color = QColor(*colors['bg'])
+            wave_color = QColor(*colors['wave'])
+            border_color = QColor(*colors['border'])
             
         if self.isSelected():
-            bg_color = bg_color.lighter(120)
-            border_color = QColor(255, 255, 255)
+            bg_color = bg_color.lighter(110)
+            # Use theme defined selected border color
+            sel_border = block_theme.get('selected_border', (255, 255, 255, 150))
+            border_color = QColor(*sel_border)
             border_width = 2
         else:
             border_width = 1
@@ -227,7 +243,8 @@ class TrackControlWidget(QWidget):
         super().__init__()
         self.track = track
         self.setFixedWidth(CONTROL_PANEL_WIDTH)
-        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # self.setAutoFillBackground(True) # Removed to prevent conflict with stylesheet
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         
@@ -238,7 +255,7 @@ class TrackControlWidget(QWidget):
         # Row 1: Name
         self.name_label = QLabel(track.name)
         self.name_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        self.name_label.setStyleSheet("color: #ddd;")
+        # self.name_label.setStyleSheet("color: #ddd;") # Removed hardcoded color
         layout.addWidget(self.name_label, 0, 0, 1, 3)
 
         # Delete Button
@@ -246,10 +263,6 @@ class TrackControlWidget(QWidget):
         self.del_btn.setFixedSize(20, 20)
         self.del_btn.setToolTip(i18n.get("track.delete"))
         self.del_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Tab capture
-        self.del_btn.setStyleSheet("""
-            QPushButton { background-color: transparent; color: #888; border: none; font-weight: bold; font-size: 14px; }
-            QPushButton:hover { color: #f44; }
-        """)
         self.del_btn.clicked.connect(self.delete_requested.emit)
         layout.addWidget(self.del_btn, 0, 3)
         
@@ -259,10 +272,6 @@ class TrackControlWidget(QWidget):
         self.mute_btn.setChecked(track.muted)
         self.mute_btn.setFixedSize(25, 25)
         self.mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Spacebar toggle
-        self.mute_btn.setStyleSheet("""
-            QPushButton { background-color: #444; border: none; border-radius: 3px; }
-            QPushButton:checked { background-color: #d44; color: white; }
-        """)
         self.mute_btn.clicked.connect(self.on_mute)
         layout.addWidget(self.mute_btn, 1, 0)
         
@@ -271,22 +280,20 @@ class TrackControlWidget(QWidget):
         self.solo_btn.setChecked(track.solo)
         self.solo_btn.setFixedSize(25, 25)
         self.solo_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Spacebar toggle
-        self.solo_btn.setStyleSheet("""
-            QPushButton { background-color: #444; border: none; border-radius: 3px; }
-            QPushButton:checked { background-color: #dd4; color: black; }
-        """)
         self.solo_btn.clicked.connect(self.on_solo)
         layout.addWidget(self.solo_btn, 1, 1)
         
-        self.bgm_check = QCheckBox("BGM")
-        self.bgm_check.setChecked(track.track_type == 'bgm')
-        self.bgm_check.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Spacebar toggle
-        self.bgm_check.toggled.connect(self.on_bgm)
-        layout.addWidget(self.bgm_check, 1, 2, 1, 2)
+        self.bgm_btn = QPushButton("BGM")
+        self.bgm_btn.setCheckable(True)
+        self.bgm_btn.setChecked(track.track_type == 'bgm')
+        self.bgm_btn.setFixedSize(40, 25)
+        self.bgm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Spacebar toggle
+        self.bgm_btn.clicked.connect(self.on_bgm)
+        layout.addWidget(self.bgm_btn, 1, 2, 1, 2)
         
         # Row 3: Volume
         vol_label = QLabel(i18n.get("label.volume"))
-        vol_label.setStyleSheet("color: #888;")
+        # vol_label.setStyleSheet("color: #888;") # Removed hardcoded color
         layout.addWidget(vol_label, 2, 0)
         
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
@@ -316,22 +323,96 @@ class TrackControlWidget(QWidget):
         menu.exec(self.mapToGlobal(pos))
 
     def update_style(self, selected):
+        current_theme = theme.get_current_theme()
+        colors = current_theme['track_control']
+        btns = colors.get('buttons', {})
+        
         if selected:
-            bg = "#3d3d3d"
-            border = "#666"
+            bg = colors['bg_selected']
+            border = colors['border_selected']
         else:
-            bg = "#282828"
-            border = "#333"
+            bg = colors['bg_normal']
+            border = colors['border_normal']
             
+        text_color = colors['text']
+        
+        # Prepare SVG Checkmark with dynamic color (URL Encoded)
+        # Using standard URL encoding for SVG to ensure compatibility
+        svg_color_encoded = text_color.replace('#', '%23')
+        checkmark_url = f"data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath d='M20 6L9 17L4 12' fill='none' stroke='{svg_color_encoded}' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+
+        # Slider Colors
+        slider_colors = colors.get('slider', {'groove': '#444', 'handle': '#888', 'sub_page': '#666'})
+        
         self.setStyleSheet(f"""
             TrackControlWidget {{
                 background-color: {bg};
                 border-bottom: 1px solid {border};
                 border-right: 1px solid {border};
             }}
-            QLabel {{ color: #ccc; }}
-            QCheckBox {{ color: #ccc; }}
+            QLabel {{ color: {text_color}; background-color: transparent; }}
+            QCheckBox {{ color: {text_color}; background-color: transparent; spacing: 5px; }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {text_color};
+                background: transparent;
+                border-radius: 2px;
+            }}
+            QCheckBox::indicator:checked {{
+                image: url("{checkmark_url}");
+            }}
+            QSlider {{ background-color: transparent; }}
+            QSlider::groove:horizontal {{
+                border: 1px solid transparent;
+                height: 4px;
+                background: {slider_colors['groove']};
+                margin: 0px;
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {slider_colors['handle']};
+                border: 1px solid {slider_colors['handle']};
+                width: 12px;
+                height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {slider_colors['sub_page']};
+                border-radius: 2px;
+            }}
         """)
+        
+        # Force style update
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update() # Force repaint
+        
+        # Update Buttons
+        if 'delete' in btns:
+            self.del_btn.setStyleSheet(f"""
+                QPushButton {{ background-color: transparent; color: {btns['delete']['normal']}; border: none; font-weight: bold; font-size: 14px; }}
+                QPushButton:hover {{ color: {btns['delete']['hover']}; }}
+            """)
+            
+        if 'mute' in btns:
+            self.mute_btn.setStyleSheet(f"""
+                QPushButton {{ background-color: {btns['mute']['bg']}; border: none; border-radius: 3px; color: {text_color}; }}
+                QPushButton:checked {{ background-color: {btns['mute']['checked_bg']}; color: {btns['mute']['checked_text']}; }}
+            """)
+            
+        if 'solo' in btns:
+            self.solo_btn.setStyleSheet(f"""
+                QPushButton {{ background-color: {btns['solo']['bg']}; border: none; border-radius: 3px; color: {text_color}; }}
+                QPushButton:checked {{ background-color: {btns['solo']['checked_bg']}; color: {btns['solo']['checked_text']}; }}
+            """)
+
+        if 'bgm' in btns:
+            self.bgm_btn.setStyleSheet(f"""
+                QPushButton {{ background-color: {btns['bgm']['bg']}; border: none; border-radius: 3px; color: {text_color}; }}
+                QPushButton:checked {{ background-color: {btns['bgm']['checked_bg']}; color: {btns['bgm']['checked_text']}; }}
+            """)
 
     def on_mute(self, checked):
         self.track.muted = checked
@@ -367,13 +448,17 @@ class TrackLaneWidget(pg.PlotWidget):
         vb = LockedViewBox()
         super().__init__(viewBox=vb)
         self.parent_gui = parent_gui
-        self.setBackground('#1e1e1e')
+        
+        current_theme = theme.get_current_theme()
+        self.setBackground(current_theme['graph']['background'])
+        
         self.setMouseEnabled(x=True, y=False)
         self.hideAxis('left')
         self.hideAxis('bottom')
         # Disable default grid
         self.showGrid(x=False, y=False)
         self.setMenuEnabled(False)
+        self.getPlotItem().hideButtons()
         
         # Add Pitch Grid (Background)
         self.pitch_grid = PitchGridItem()
@@ -389,6 +474,18 @@ class TrackLaneWidget(pg.PlotWidget):
         # Limits
         self.setLimits(xMin=0)
         self.setYRange(-10, 110) # Normalized Y range with padding to prevent clipping
+        
+        self.update_theme()
+
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        self.setBackground(current_theme['graph']['background'])
+        self.pitch_grid.update_theme()
+        self.music_grid.update_theme()
+        # Force redraw of items to pick up new colors
+        for item in self.items():
+            if isinstance(item, AudioBlockItem):
+                item.update()
 
     def wheelEvent(self, event):
         # Pass wheel events to parent for global zoom handling
@@ -427,8 +524,20 @@ class TrackWidget(QWidget):
         self.lane.addItem(self.item)
         
         # Cursor (Vertical Line)
-        self.cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('y', width=1))
+        self.cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('y', width=2))
+        self.cursor.setZValue(2000) # Ensure it's above everything
         self.lane.addItem(self.cursor)
+        
+        self.update_theme()
+
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        color = current_theme['piano_roll']['cursor']
+        self.cursor.setPen(pg.mkPen(color, width=2))
+        # Refresh control style
+        self.control.update_style(self.item.isSelected())
+        # Refresh lane style
+        self.lane.update_theme()
 
     def set_height(self, height):
         self.height = height
@@ -458,6 +567,9 @@ class TimelinePanel(QWidget):
         self.track_height = DEFAULT_TRACK_HEIGHT
         self.rows = []
         
+        # Apply rounded corners
+        self.setStyleSheet("TimelinePanel { border-radius: 10px; }")
+        
         # Middle mouse drag state
         self._is_panning = False
         self._last_pan_pos = None
@@ -474,6 +586,7 @@ class TimelinePanel(QWidget):
         
         # Spacer for Control Panel
         self.ruler_spacer = QWidget()
+        self.ruler_spacer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.ruler_spacer.setFixedWidth(CONTROL_PANEL_WIDTH)
         self.ruler_spacer.setStyleSheet("background-color: #282828; border-bottom: 1px solid #444; border-right: 1px solid #333;")
         self.ruler_layout.addWidget(self.ruler_spacer)
@@ -489,6 +602,10 @@ class TimelinePanel(QWidget):
         self.ruler_plot.setMouseEnabled(x=True, y=False)
         self.ruler_plot.setMenuEnabled(False)
         self.ruler_plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
+        # Disable clipping to allow cursor to draw over axis
+        self.ruler_plot.plotItem.vb.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, False)
+        # Ensure ViewBox is above Axis so cursor draws on top
+        self.ruler_plot.plotItem.vb.setZValue(10)
         
         # Set default limits (3 minutes)
         self.default_duration = 180 # seconds
@@ -512,10 +629,16 @@ class TimelinePanel(QWidget):
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         
         self.tracks_container = QWidget()
+        self.tracks_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.tracks_layout = QVBoxLayout(self.tracks_container)
         self.tracks_layout.setContentsMargins(0, 0, 0, 0)
         self.tracks_layout.setSpacing(1) # 1px gap between tracks
         self.tracks_layout.addStretch()
+        
+        # Set initial background
+        current_theme = theme.get_current_theme()
+        if 'panel_background' in current_theme['track_control']:
+             self.tracks_container.setStyleSheet(f"background-color: {current_theme['track_control']['panel_background']};")
         
         self.scroll_area.setWidget(self.tracks_container)
         self.layout.addWidget(self.scroll_area)
@@ -528,6 +651,35 @@ class TimelinePanel(QWidget):
         
         # Sync Ruler View
         self.ruler_plot.sigRangeChanged.connect(self.on_ruler_range_changed)
+        
+        self.update_theme()
+
+    def update_theme(self):
+        current_theme = theme.get_current_theme()
+        
+        # Update Ruler Spacer
+        colors = current_theme['track_control']
+        self.ruler_spacer.setStyleSheet(f"background-color: {colors['bg_normal']}; border-bottom: 1px solid {colors['border_normal']}; border-right: 1px solid {colors['border_normal']};")
+        
+        # Update Track Container Background
+        if 'panel_background' in colors:
+            # Keep border radius if set on container, but here we set on tracks_container which is inside scroll area
+            self.tracks_container.setStyleSheet(f"background-color: {colors['panel_background']};")
+            
+        # Update Main Panel Style for Rounded Corners
+        self.setStyleSheet("TimelinePanel { border-radius: 10px; }")
+        
+        # Update Ruler Plot Background
+        self.ruler_plot.setBackground(current_theme['graph']['background'])
+        
+        # Update Ruler Cursor
+        self.ruler_cursor.update_theme()
+        
+        # Update Tracks
+        for i in range(self.tracks_layout.count()):
+            item = self.tracks_layout.itemAt(i)
+            if item.widget() and isinstance(item.widget(), TrackWidget):
+                item.widget().update_theme()
 
     def set_initial_view_range(self):
         # Calculate frames for 4 measures
