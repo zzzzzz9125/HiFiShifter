@@ -97,6 +97,7 @@
     "msg.no_valid_vocalshifter_data": "没有有效的 VocalShifter 数据",
     "msg.vocalshifter_data_loaded": "VocalShifter 数据已加载",
     "msg.load_vocalshifter_failed": "加载 VocalShifter 数据失败",
+    "msg.vocalshifter_disabled_samples": "已禁用编辑的采样点",
     "status.loading_vocalshifter_data": "正在加载 VocalShifter 数据...",
     "status.vocalshifter_data_applied": "VocalShifter 数据已应用",
     "status.vocalshifter_load_failed": "加载 VocalShifter 数据失败",

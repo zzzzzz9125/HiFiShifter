@@ -1689,20 +1689,20 @@ class HifiShifterGUI(QMainWindow):
                         value = struct.unpack('<d', double_bytes)[0]  # 小端序
                         doubles.append(value)
                 
-                if len(doubles) >= 4:  # 至少需要4个值才能获取第1和第3个
+                if len(doubles) >= 4:  # 至少需要4个值才能获取第1、第2和第3个
                     start_time = doubles[0]  # 第1个：起始时间（秒）
+                    disable_edit = doubles[1]  # 第2个：是否禁用编辑 (1.0=是, 0.0=否)
                     pitch_cents = doubles[2]  # 第3个：音分
                     
-                    # 将音分转换为MIDI音高
-                    # 0音分 = C-1 (MIDI 0)
-                    # 6000音分 = C4 (MIDI 60)
-                    midi_pitch = pitch_cents / 100.0
-                    
-                    vocalshifter_data.append((start_time, midi_pitch))
+                    # 只存储我们需要的数据
+                    vocalshifter_data.append((start_time, disable_edit, pitch_cents))
             
             if not vocalshifter_data:
                 QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.no_valid_vocalshifter_data"))
                 return
+            
+            # 统计禁用了编辑的采样点数量
+            disabled_count = sum(1 for _, disable_edit, _ in vocalshifter_data if disable_edit == 1.0)
             
             # 将VocalShifter数据应用到当前音轨
             self.apply_vocalshifter_to_track(track, vocalshifter_data)
@@ -1710,7 +1710,8 @@ class HifiShifterGUI(QMainWindow):
             self.status_label.setText(i18n.get("status.vocalshifter_data_applied"))
             QMessageBox.information(self, i18n.get("msg.success"), 
                                 i18n.get("msg.vocalshifter_data_loaded") + 
-                                f": {len(vocalshifter_data)} {i18n.get('label.samples')}")
+                                f": {len(vocalshifter_data)} {i18n.get('label.samples')}\n" +
+                                i18n.get("msg.vocalshifter_disabled_samples") + f": {disabled_count}")
             
         except Exception as e:
             QMessageBox.critical(self, i18n.get("msg.error"), 
@@ -1720,6 +1721,7 @@ class HifiShifterGUI(QMainWindow):
     def apply_vocalshifter_to_track(self, track, vocalshifter_data):
         """
         将VocalShifter数据应用到音轨
+        现在vocalshifter_data是一个三元组列表：(start_time, disable_edit, pitch_cents)
         """
         # 推入撤销栈
         self.push_undo()
@@ -1740,18 +1742,25 @@ class HifiShifterGUI(QMainWindow):
             closest_sample = None
             min_time_diff = float('inf')
             
-            for sample_time, sample_pitch in vocalshifter_data:
+            for sample_time, disable_edit, sample_pitch in vocalshifter_data:
                 time_diff = abs(frame_time - sample_time)
                 if time_diff < min_time_diff:
                     min_time_diff = time_diff
-                    closest_sample = (sample_time, sample_pitch)
+                    closest_sample = (sample_time, disable_edit, sample_pitch)
             
             # 如果找到足够接近的采样点，则应用音高
             if closest_sample and min_time_diff < (hop_size / sr):  # 在半个hop_size范围内
-                _, target_pitch = closest_sample
+                _, disable_edit, target_pitch = closest_sample
                 
-                # 应用音高（可以添加平滑过渡）
-                track.f0_edited[i] = target_pitch
+                if disable_edit == 1.0:
+                    # 禁用编辑：恢复初始音高
+                    if track.f0_original is not None and i < len(track.f0_original):
+                        track.f0_edited[i] = track.f0_original[i]
+                else:
+                    # 未禁用编辑：应用修正后的音高
+                    # 将音分转换为MIDI音高
+                    midi_pitch = target_pitch / 100.0
+                    track.f0_edited[i] = midi_pitch
         
         # 标记所有段为脏，需要重新合成
         for state in track.segment_states:

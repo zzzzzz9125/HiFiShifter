@@ -97,6 +97,7 @@
     "msg.no_valid_vocalshifter_data": "No valid VocalShifter data",
     "msg.vocalshifter_data_loaded": "VocalShifter data loaded",
     "msg.load_vocalshifter_failed": "Failed to load VocalShifter data",
+    "msg.vocalshifter_disabled_samples": "Disabled edit samples",
     "status.loading_vocalshifter_data": "Loading VocalShifter data...",
     "status.vocalshifter_data_applied": "VocalShifter data applied",
     "status.vocalshifter_load_failed": "Failed to load VocalShifter data",
