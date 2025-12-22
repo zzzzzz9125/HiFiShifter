@@ -44,6 +44,7 @@ pip install PyQt6 pyqtgraph sounddevice numpy scipy torch torchaudio pyyaml
 4. **编辑与合成**:
    - 使用左键在钢琴卷帘上绘制音高曲线。
    - 点击 `播放` -> `合成并播放` 听取效果。
+   - **复制/粘贴音高**: 在左侧轨道列表的某个轨道上点击右键，选择“复制音高”或“粘贴音高”，可在不同轨道间复用音高曲线。
 
 ## 常用快捷键
 

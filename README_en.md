@@ -44,6 +44,7 @@ pip install PyQt6 pyqtgraph sounddevice numpy scipy torch torchaudio pyyaml
 4. **Edit & Synthesize**:
    - Use Left Click to draw pitch curves on the piano roll.
    - Click `Playback` -> `Synthesize & Play` to hear the result.
+   - **Copy/Paste Pitch**: Right-click on a track in the left track list and select "Copy Pitch" or "Paste Pitch" to reuse pitch curves across tracks.
 
 ## Shortcuts
 
