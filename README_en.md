@@ -44,6 +44,20 @@ pip install PyQt6 pyqtgraph sounddevice numpy scipy torch torchaudio pyyaml
    - Use Left Click to draw pitch curves on the piano roll.
    - Click `Playback` -> `Synthesize & Play` to hear the result.
 
+## Shortcuts
+
+| Action                        | Shortcut / Mouse Action |
+| :---------------------------- | :---------------------- |
+| **Pan View**                  | Middle Mouse Drag       |
+| **Zoom Horizontal (Time)**    | Ctrl + Scroll           |
+| **Zoom Vertical (Pitch)**     | Alt + Scroll            |
+| **Draw Pitch**                | Left Click              |
+| **Erase Pitch**               | Right Click             |
+| **Play/Pause**                | Space                   |
+| **Undo**                      | Ctrl + Z                |
+| **Redo**                      | Ctrl + Y                |
+| **Toggle Mode (Edit/Select)** | Tab                     |
+
 ## Known Issues
 
 There are currently many issues, such as the inability to change volume during playback and a high probability of freezing when importing long audio files.
