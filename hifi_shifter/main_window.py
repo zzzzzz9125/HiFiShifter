@@ -112,6 +112,10 @@ class HifiShifterGUI(QMainWindow):
         open_action.triggered.connect(self.open_project_dialog)
         file_menu.addAction(open_action)
         
+        open_vocalshifter_action = QAction(i18n.get("menu.file.open_vocalshifter_project"), self)
+        open_vocalshifter_action.triggered.connect(self.open_vocalshifter_project_dialog)
+        file_menu.addAction(open_vocalshifter_action)
+        
         save_action = QAction(i18n.get("menu.file.save"), self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_project)
@@ -152,7 +156,7 @@ class HifiShifterGUI(QMainWindow):
         edit_menu.addAction(redo_action)
 
         paste_vocalshifter_action = QAction(i18n.get("menu.edit.paste_vocalshifter"), self)
-        paste_vocalshifter_action.triggered.connect(self.paste_vocalshifter_data)
+        paste_vocalshifter_action.triggered.connect(self.paste_vocalshifter_clipboard_data)
         edit_menu.addAction(paste_vocalshifter_action)
 
         # View Menu
@@ -1708,7 +1712,7 @@ class HifiShifterGUI(QMainWindow):
     def stop_audio(self):
         self.stop_playback()
 
-    def paste_vocalshifter_data(self):
+    def paste_vocalshifter_clipboard_data(self):
         """
         读取并应用 VocalShifter 剪贴板数据
         """
@@ -1735,7 +1739,7 @@ class HifiShifterGUI(QMainWindow):
             return
         
         try:
-            self.status_label.setText(i18n.get("status.loading_vocalshifter_data"))
+            self.status_label.setText(i18n.get("status.loading_vocalshifter_clipboard_data"))
             QApplication.processEvents()
             
             # 读取二进制文件
@@ -1754,7 +1758,7 @@ class HifiShifterGUI(QMainWindow):
             
             # 解析 VocalShifter 数据
             num_samples = len(data) // 0x80
-            vocalshifter_data = []
+            vocalshifter_clipboard_data = []
             
             for i in range(num_samples):
                 sample_start = i * 0x80
@@ -1769,37 +1773,39 @@ class HifiShifterGUI(QMainWindow):
                         value = struct.unpack('<d', double_bytes)[0]  # 小端序
                         doubles.append(value)
                 
-                if len(doubles) >= 4:  # 至少需要4个值才能获取第1和第3个
+                if len(doubles) >= 4:  # 至少需要4个值才能获取第1、第2和第3个
                     start_time = doubles[0]  # 第1个：起始时间（秒）
+                    disable_edit = doubles[1]  # 第2个：是否禁用编辑 (1.0=是, 0.0=否)
                     pitch_cents = doubles[2]  # 第3个：音分
                     
-                    # 将音分转换为MIDI音高
-                    # 0音分 = C-1 (MIDI 0)
-                    # 6000音分 = C4 (MIDI 60)
-                    midi_pitch = pitch_cents / 100.0
-                    
-                    vocalshifter_data.append((start_time, midi_pitch))
+                    # 只存储我们需要的数据
+                    vocalshifter_clipboard_data.append((start_time, disable_edit, pitch_cents))
             
-            if not vocalshifter_data:
-                QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.no_valid_vocalshifter_data"))
+            if not vocalshifter_clipboard_data:
+                QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.no_valid_vocalshifter_clipboard_data"))
                 return
             
-            # 将VocalShifter数据应用到当前音轨
-            self.apply_vocalshifter_to_track(track, vocalshifter_data)
+            # 统计禁用了编辑的采样点数量
+            disabled_count = sum(1 for _, disable_edit, _ in vocalshifter_clipboard_data if disable_edit == 1.0)
             
-            self.status_label.setText(i18n.get("status.vocalshifter_data_applied"))
+            # 将VocalShifter数据应用到当前音轨
+            self.apply_vocalshifter_clipboard_to_track(track, vocalshifter_clipboard_data)
+            
+            self.status_label.setText(i18n.get("status.vocalshifter_clipboard_data_applied"))
             QMessageBox.information(self, i18n.get("msg.success"), 
-                                i18n.get("msg.vocalshifter_data_loaded") + 
-                                f": {len(vocalshifter_data)} {i18n.get('label.samples')}")
+                                i18n.get("msg.vocalshifter_clipboard_data_loaded") + 
+                                f": {len(vocalshifter_clipboard_data)} {i18n.get('label.samples')}\n" +
+                                i18n.get("msg.vocalshifter_disabled_samples") + f": {disabled_count}")
             
         except Exception as e:
             QMessageBox.critical(self, i18n.get("msg.error"), 
                                 i18n.get("msg.load_vocalshifter_failed") + f": {str(e)}")
-            self.status_label.setText(i18n.get("status.vocalshifter_load_failed"))
+            self.status_label.setText(i18n.get("status.vocalshifter_clipboard_data_load_failed"))
 
-    def apply_vocalshifter_to_track(self, track, vocalshifter_data):
+    def apply_vocalshifter_clipboard_to_track(self, track, vocalshifter_clipboard_data):
         """
         将VocalShifter数据应用到音轨
+        现在vocalshifter_clipboard_data是一个三元组列表：(start_time, disable_edit, pitch_cents)
         """
         # 推入撤销栈
         self.push_undo()
@@ -1809,7 +1815,7 @@ class HifiShifterGUI(QMainWindow):
         hop_size = self.processor.config['hop_size']
         
         # 按时间排序
-        vocalshifter_data.sort(key=lambda x: x[0])
+        vocalshifter_clipboard_data.sort(key=lambda x: x[0])
         
         # 将VocalShifter数据映射到f0帧
         for i in range(len(track.f0_edited)):
@@ -1820,18 +1826,518 @@ class HifiShifterGUI(QMainWindow):
             closest_sample = None
             min_time_diff = float('inf')
             
-            for sample_time, sample_pitch in vocalshifter_data:
+            for sample_time, disable_edit, sample_pitch in vocalshifter_clipboard_data:
                 time_diff = abs(frame_time - sample_time)
                 if time_diff < min_time_diff:
                     min_time_diff = time_diff
-                    closest_sample = (sample_time, sample_pitch)
+                    closest_sample = (sample_time, disable_edit, sample_pitch)
             
             # 如果找到足够接近的采样点，则应用音高
             if closest_sample and min_time_diff < (hop_size / sr):  # 在半个hop_size范围内
-                _, target_pitch = closest_sample
+                _, disable_edit, target_pitch = closest_sample
                 
-                # 应用音高（可以添加平滑过渡）
-                track.f0_edited[i] = target_pitch
+                if disable_edit == 1.0:
+                    # 禁用编辑：恢复初始音高
+                    if track.f0_original is not None and i < len(track.f0_original):
+                        track.f0_edited[i] = track.f0_original[i]
+                else:
+                    # 未禁用编辑：应用修正后的音高
+                    # 将音分转换为MIDI音高
+                    midi_pitch = target_pitch / 100.0
+                    track.f0_edited[i] = midi_pitch
+        
+        # 标记所有段为脏，需要重新合成
+        for state in track.segment_states:
+            state['dirty'] = True
+        
+        # 更新绘图
+        self.update_plot()
+
+    def open_vocalshifter_project_dialog(self):
+        """打开VocalShifter工程文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            i18n.get("dialog.open_vocalshifter_project"), 
+            "", 
+            "VocalShifter Project (*.vshp *.vsp)"
+        )
+        if file_path:
+            self.load_vocalshifter_project(file_path)
+
+    def load_vocalshifter_project(self, file_path):
+        """加载并解析VocalShifter工程文件"""
+        import locale
+        import struct
+        try:
+            self.status_label.setText(i18n.get("status.loading_vocalshifter_project"))
+            QApplication.processEvents()
+            
+            with open(file_path, 'rb') as f:
+                # 1. 检查文件头
+                header = f.read(16)
+                if header[:4] != b'VSPD':
+                    QMessageBox.critical(self, i18n.get("msg.error"), 
+                                    i18n.get("msg.vocalshifter_invalid_header"))
+                    return
+                
+                # 读取文件大小（小端序）
+                file_size = struct.unpack('<I', header[12:16])[0]
+                
+                # 存储工程文件夹路径，用于解析相对路径
+                project_dir = os.path.dirname(os.path.abspath(file_path))
+                
+                # 解析数据块
+                project_info = {}
+                tracks = []
+                audio_blocks = []  # ITMP数据块
+                itmp_audio_blocks = []  # Itmp数据块（包含Ctrp数据）
+                
+                current_offset = 16  # 跳过文件头
+                
+                # 第一轮：收集所有ITMP数据块
+                f.seek(current_offset)
+                while current_offset < file_size:
+                    chunk_header = f.read(8)
+                    
+                    if len(chunk_header) < 8:
+                        break
+                        
+                    chunk_type = chunk_header[:4]
+                    chunk_version = struct.unpack('<I', chunk_header[4:8])[0]
+                    
+                    if chunk_type == b'PRJP':
+                        # PRJP 数据块 - 工程信息
+                        prjp_data = f.read(0x108 - 8)  # 总长度0x108，减去已读的8字节
+                        
+                        # 采样率 (偏移16字节，相对于PRJP数据开始)
+                        sample_rate = struct.unpack('<I', prjp_data[16:20])[0]
+                        
+                        # 拍号分子 (偏移20字节)
+                        beats_per_bar = struct.unpack('<I', prjp_data[20:24])[0]
+                        
+                        # 拍号分母 (偏移24字节)
+                        beat_unit = struct.unpack('<I', prjp_data[24:28])[0]
+                        
+                        # BPM (偏移32字节)
+                        bpm = struct.unpack('<d', prjp_data[32:40])[0]
+                        
+                        project_info = {
+                            'sample_rate': sample_rate,
+                            'beats_per_bar': beats_per_bar,
+                            'beat_unit': beat_unit,
+                            'bpm': bpm
+                        }
+                        
+                        current_offset += 0x108
+                        
+                    elif chunk_type == b'TRKP':
+                        # TRKP 数据块 - 轨道信息
+                        trkp_data = f.read(0x108 - 8)
+                        
+                        # 轨道名称 (64字节，系统本地编码)
+                        track_name_bytes = trkp_data[0:64]
+                        # 找到第一个null终止符
+                        null_pos = track_name_bytes.find(b'\x00')
+                        if null_pos != -1:
+                            track_name_bytes = track_name_bytes[:null_pos]
+                        
+                        # 解码为系统默认编码
+                        track_name = track_name_bytes.decode(locale.getpreferredencoding())
+                        
+                        # 音量倍率 (偏移64字节)
+                        volume = struct.unpack('<d', trkp_data[64:72])[0]
+                        
+                        # 声像 (偏移72字节) - HifiShifter不支持，忽略
+                        # pan = struct.unpack('<d', trkp_data[72:80])[0]
+                        
+                        # 静音 (偏移80字节)
+                        muted = struct.unpack('<I', trkp_data[80:84])[0] == 1
+                        
+                        # 独奏 (偏移84字节)
+                        solo = struct.unpack('<I', trkp_data[84:88])[0] == 1
+                        
+                        # 反相 (偏移96字节) - HifiShifter不支持，忽略
+                        # inverted = struct.unpack('<I', trkp_data[96:100])[0] == 1
+                        
+                        track_info = {
+                            'name': track_name,
+                            'volume': volume,
+                            'muted': muted,
+                            'solo': solo
+                        }
+                        
+                        tracks.append(track_info)
+                        current_offset += 0x108
+                        
+                    elif chunk_type == b'ITMP':
+                        # ITMP 数据块 - 音频块信息
+                        itmp_data = f.read(0x208 - 8)
+                        
+                        # 音频文件路径 (从偏移0开始，直到0x00)
+                        path_bytes = bytearray()
+                        for i in range(0, 0x108):
+                            byte = itmp_data[i:i+1]
+                            if byte == b'\x00':
+                                break
+                            path_bytes.extend(byte)
+                        
+                        # 解码为系统默认编码
+                        file_path_str = path_bytes.decode(locale.getpreferredencoding())
+                        
+                        # 解析轨道索引 (偏移0x108)
+                        track_index = struct.unpack('<I', itmp_data[0x108:0x10C])[0]
+                        
+                        # 起始位置 (偏移0x110，单位：采样点)
+                        start_position_samples = struct.unpack('<d', itmp_data[0x110:0x118])[0]
+                        
+                        # 转换为秒
+                        start_position_seconds = start_position_samples / project_info.get('sample_rate', 44100)
+                        
+                        # 转换为HifiShifter的帧单位（需要hop_size）
+                        hop_size = self.processor.config.get('hop_size', 512) if self.processor.config else 512
+                        start_frame = int(start_position_seconds * project_info.get('sample_rate', 44100) / hop_size)
+                        
+                        audio_block = {
+                            'file_path': file_path_str,
+                            'track_index': track_index,
+                            'start_position_samples': start_position_samples,
+                            'start_position_seconds': start_position_seconds,
+                            'start_frame': start_frame,
+                            'tuning_samples': []  # 将在后面填充Ctrp数据
+                        }
+                        
+                        audio_blocks.append(audio_block)
+                        current_offset += 0x208
+                        
+                    else:
+                        # 未知数据块，跳过8字节
+                        current_offset += 8
+                        f.seek(current_offset)
+                
+                # 第二轮：收集所有Itmp数据块和对应的Ctrp数据
+                current_offset = 16  # 重置偏移，重新扫描文件
+                f.seek(current_offset)
+                itmp_block_index = 0  # 用于跟踪Itmp数据块的顺序
+                
+                while current_offset < file_size:
+                    chunk_header = f.read(8)
+                    
+                    if len(chunk_header) < 8:
+                        break
+                        
+                    chunk_type = chunk_header[:4]
+                    chunk_version = struct.unpack('<I', chunk_header[4:8])[0]
+                    
+                    if chunk_type == b'Itmp':
+                        # Itmp 数据块 - 音频块调音数据头
+                        itmp_data = f.read(0x108 - 8)  # 总长度0x108，减去已读的8字节
+                        
+                        # 创建Itmp音频块记录
+                        itmp_block = {
+                            'index': itmp_block_index,
+                            'tuning_samples': []
+                        }
+                        
+                        # 检查是否有对应的ITMP音频块
+                        if itmp_block_index < len(audio_blocks):
+                            # 将Itmp块与对应的ITMP块关联
+                            audio_blocks[itmp_block_index]['itmp_block'] = itmp_block
+                        
+                        current_offset += 0x108
+                        f.seek(current_offset)
+                        
+                        # 读取紧随其后的Ctrp数据块
+                        while current_offset < file_size:
+                            # 预读下一个数据块头
+                            next_chunk_header = f.read(8)
+                            if len(next_chunk_header) < 8:
+                                break
+                            
+                            next_chunk_type = next_chunk_header[:4]
+                            
+                            if next_chunk_type == b'Ctrp':
+                                # Ctrp 数据块 - 调音采样点
+                                ctrp_data = f.read(0x68 - 8)  # 总长度0x68，减去已读的8字节
+                                
+                                # 是否禁用编辑 (偏移18字节)
+                                disabled = struct.unpack('<h', ctrp_data[18:20])[0] == 1
+                                
+                                # 修正后的音高 (偏移22字节，单位：音分)
+                                pitch_cents = struct.unpack('<h', ctrp_data[22:24])[0]
+                                
+                                # 转换为MIDI音高
+                                # VocalShifter: 0 = C-1, 6000 = C4
+                                # 转换为MIDI: C-1 = MIDI 0, C4 = MIDI 60
+                                # 音分转半音: pitch_cents / 100
+                                # C-1是MIDI 0，所以: midi_pitch = pitch_cents / 100
+                                midi_pitch = pitch_cents / 100.0
+                                
+                                tuning_sample = {
+                                    'disabled': disabled,
+                                    'pitch_cents': pitch_cents,
+                                    'midi_pitch': midi_pitch
+                                }
+                                
+                                # 添加到Itmp块的调音采样点列表
+                                itmp_block['tuning_samples'].append(tuning_sample)
+                                
+                                # 如果有关联的ITMP音频块，也添加到那里
+                                if itmp_block_index < len(audio_blocks):
+                                    audio_blocks[itmp_block_index]['tuning_samples'].append(tuning_sample)
+                                
+                                current_offset += 0x68
+                                f.seek(current_offset)
+                            else:
+                                # 不是Ctrp数据块，回退8字节并跳出循环
+                                f.seek(current_offset)  # 回到数据块开始位置
+                                break
+                        
+                        itmp_block_index += 1
+                    else:
+                        # 其他数据块，跳过8字节
+                        current_offset += 8
+                        f.seek(current_offset)
+                
+                # 现在我们已经解析了所有数据，开始创建HifiShifter工程
+                
+                # 清空当前工程
+                self.tracks = []
+                self.current_track_idx = -1
+                self.timeline_panel.refresh_tracks([])
+                
+                # 设置工程参数
+                if project_info:
+                    self.bpm_spin.setValue(project_info.get('bpm', 120))
+                    # 设置网格单位（拍号）
+                    # HifiShifter使用beats_spin表示拍号分子，分母固定为4
+                    # 所以我们需要将VocalShifter的拍号转换为HifiShifter的格式
+                    beats_per_bar = project_info.get('beats_per_bar', 4)
+                    beat_unit = project_info.get('beat_unit', 4)
+                    
+                    # 如果分母是4，直接使用分子
+                    if beat_unit == 4:
+                        self.beats_spin.setValue(beats_per_bar)
+                    else:
+                        # 否则进行转换（简化处理）
+                        self.beats_spin.setValue(beats_per_bar)
+                        QMessageBox.information(self, i18n.get("msg.info"), 
+                                            i18n.get("msg.time_signature_converted") + 
+                                            f" {beats_per_bar}/{beat_unit} -> {beats_per_bar}/4")
+                
+                # 统计无法导入的文件
+                unsupported_files = []
+                
+                # 为每个音频块创建轨道
+                for i, audio_block in enumerate(audio_blocks):
+                    # 解析文件路径
+                    raw_path = audio_block['file_path']
+                    
+                    # 检查是否是相对路径
+                    if not os.path.isabs(raw_path):
+                        # 尝试相对于工程文件路径
+                        abs_path = os.path.join(project_dir, raw_path)
+                    else:
+                        abs_path = raw_path
+                    
+                    # 检查文件是否存在
+                    if not os.path.exists(abs_path):
+                        # 尝试在工程文件夹内查找
+                        file_name = os.path.basename(raw_path)
+                        alt_path = os.path.join(project_dir, file_name)
+                        if os.path.exists(alt_path):
+                            abs_path = alt_path
+                        else:
+                            unsupported_files.append(f"{raw_path} ({i18n.get('msg.file_not_found')})")
+                            continue
+                    
+                    # 检查文件格式是否支持
+                    file_ext = os.path.splitext(abs_path)[1].lower()
+                    supported_extensions = {'.wav', '.flac', '.mp3'}
+                    
+                    if file_ext not in supported_extensions:
+                        unsupported_files.append(f"{raw_path} ({i18n.get('msg.unsupported_format')})")
+                        continue
+                    
+                    # 获取对应的轨道信息
+                    track_info = None
+                    if audio_block['track_index'] < len(tracks):
+                        track_info = tracks[audio_block['track_index']]
+                    
+                    # 创建轨道名称
+                    if track_info:
+                        # 如果轨道中有多个音频块，添加序号
+                        track_count_in_track = sum(1 for ab in audio_blocks if ab['track_index'] == audio_block['track_index'])
+                        if track_count_in_track > 1:
+                            track_name = f"{track_info['name']}_{i+1}"
+                        else:
+                            track_name = track_info['name']
+                    else:
+                        track_name = f"Track_{i+1}"
+                    
+                    # 创建并加载轨道
+                    try:
+                        track = Track(track_name, abs_path, track_type='vocal')
+                        track.load(self.processor)
+                        
+                        # 设置轨道参数
+                        if track_info:
+                            track.volume = track_info.get('volume', 1.0)
+                            track.muted = track_info.get('muted', False)
+                            track.solo = track_info.get('solo', False)
+                        
+                        # 设置起始位置
+                        track.start_frame = audio_block['start_frame']
+                        
+                        # 应用调音采样点数据
+                        if audio_block['tuning_samples'] and track.f0_edited is not None:
+                            # 将调音采样点应用到音高曲线
+                            self.apply_vocalshifter_tuning_samples(track, audio_block['tuning_samples'])
+                        
+                        self.tracks.append(track)
+                        
+                    except Exception as e:
+                        unsupported_files.append(f"{raw_path} ({str(e)})")
+                
+                # 更新UI
+                if self.processor.config:
+                    self.timeline_panel.hop_size = self.processor.config['hop_size']
+                self.timeline_panel.refresh_tracks(self.tracks)
+                
+                # 如果有无法导入的文件，显示警告
+                if unsupported_files:
+                    warning_msg = i18n.get("msg.unsupported_files_found") + ":\n\n"
+                    warning_msg += "\n".join(unsupported_files[:10])  # 最多显示10个
+                    if len(unsupported_files) > 10:
+                        warning_msg += f"\n\n...{len(unsupported_files) - 10} more"
+                    
+                    QMessageBox.warning(self, i18n.get("msg.warning"), warning_msg)
+                
+                self.status_label.setText(i18n.get("status.vocalshifter_project_loaded"))
+                
+        except Exception as e:
+            QMessageBox.critical(self, i18n.get("msg.error"), 
+                            i18n.get("msg.load_vocalshifter_project_failed") + f": {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.status_label.setText(i18n.get("status.vocalshifter_load_failed"))
+
+    def apply_vocalshifter_tuning_samples(self, track, tuning_samples):
+        """
+        将VocalShifter调音采样点应用到音轨
+        每个调音采样点时间长度为0.005秒，相邻点之间线性插值
+        """
+        if not tuning_samples or track.f0_edited is None:
+            return
+        
+        # 推入撤销栈
+        self.push_undo()
+        
+        # 获取音频参数
+        sr = track.sr if track.sr else self.processor.config['audio_sample_rate']
+        hop_size = self.processor.config['hop_size']
+        
+        # 创建调音采样点的时间-音高列表
+        # 每个调音采样点对应0.005秒
+        time_pitch_pairs = []
+        
+        for i, sample in enumerate(tuning_samples):
+            # 计算采样点时间（秒）
+            sample_time = i * 0.005
+            
+            # 如果禁用编辑，则使用原始音高
+            if sample.get('disabled', False):
+                # 需要找到对应时间的原始音高
+                # 我们将这个点标记为特殊值，稍后处理
+                time_pitch_pairs.append((sample_time, None, True))  # (时间, 音高, 是否禁用)
+            else:
+                # 使用修正后的音高
+                midi_pitch = sample.get('midi_pitch', 0)
+                time_pitch_pairs.append((sample_time, midi_pitch, False))
+        
+        if not time_pitch_pairs:
+            return
+        
+        # 计算音频总时长（秒）
+        audio_duration = len(track.audio) / sr if track.audio is not None else 0
+        
+        # 处理每个音高帧
+        for i in range(len(track.f0_edited)):
+            # 计算当前帧对应的时间（秒）
+            frame_time = (i * hop_size) / sr
+            
+            # 如果超出音频时长，跳过
+            if frame_time > audio_duration:
+                continue
+            
+            # 找到当前时间所在的两个调音采样点
+            sample_index = int(frame_time / 0.005)
+            next_sample_index = sample_index + 1
+            
+            # 处理边界情况
+            if sample_index >= len(time_pitch_pairs):
+                # 超出最后一个采样点，使用最后一个采样点的值
+                last_time, last_pitch, last_disabled = time_pitch_pairs[-1]
+                if last_disabled:
+                    # 使用原始音高
+                    if track.f0_original is not None and i < len(track.f0_original):
+                        track.f0_edited[i] = track.f0_original[i]
+                elif last_pitch is not None:
+                    track.f0_edited[i] = last_pitch
+                continue
+            
+            if sample_index < 0:
+                # 在第一个采样点之前，使用第一个采样点的值
+                first_time, first_pitch, first_disabled = time_pitch_pairs[0]
+                if first_disabled:
+                    # 使用原始音高
+                    if track.f0_original is not None and i < len(track.f0_original):
+                        track.f0_edited[i] = track.f0_original[i]
+                elif first_pitch is not None:
+                    track.f0_edited[i] = first_pitch
+                continue
+            
+            # 获取当前采样点和下一个采样点
+            current_time, current_pitch, current_disabled = time_pitch_pairs[sample_index]
+            
+            if next_sample_index >= len(time_pitch_pairs):
+                # 没有下一个采样点，使用当前采样点的值
+                if current_disabled:
+                    # 使用原始音高
+                    if track.f0_original is not None and i < len(track.f0_original):
+                        track.f0_edited[i] = track.f0_original[i]
+                elif current_pitch is not None:
+                    track.f0_edited[i] = current_pitch
+                continue
+            
+            next_time, next_pitch, next_disabled = time_pitch_pairs[next_sample_index]
+            
+            # 计算时间比例（用于线性插值）
+            time_ratio = (frame_time - current_time) / (next_time - current_time)
+            
+            # 处理两个采样点都禁用的情况
+            if current_disabled and next_disabled:
+                # 两个点都禁用，使用原始音高
+                if track.f0_original is not None and i < len(track.f0_original):
+                    track.f0_edited[i] = track.f0_original[i]
+                continue
+            
+            # 处理只有一个点禁用的情况
+            if current_disabled:
+                # 当前点禁用，使用原始音高
+                if track.f0_original is not None and i < len(track.f0_original):
+                    track.f0_edited[i] = track.f0_original[i]
+                continue
+            
+            if next_disabled:
+                # 下一个点禁用，使用当前点的音高（不插值）
+                if current_pitch is not None:
+                    track.f0_edited[i] = current_pitch
+                continue
+            
+            # 两个点都未禁用，进行线性插值
+            if current_pitch is not None and next_pitch is not None:
+                interpolated_pitch = current_pitch + (next_pitch - current_pitch) * time_ratio
+                track.f0_edited[i] = interpolated_pitch
         
         # 标记所有段为脏，需要重新合成
         for state in track.segment_states:
