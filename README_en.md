@@ -74,6 +74,7 @@ There are currently many issues, such as the inability to change volume during p
 ## Documentation
 
 - [Development Manual](DEVELOPMENT_en.md)
+- [Updating Plan](todo.md)
 
 ## Acknowledgements
 

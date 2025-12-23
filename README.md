@@ -74,6 +74,7 @@ pip install PyQt6 pyqtgraph sounddevice numpy scipy torch torchaudio pyyaml
 ## 文档
 
 - [开发手册](DEVELOPMENT_zh.md)
+- [更新计划](todo.md)
 
 ## 致谢
 
