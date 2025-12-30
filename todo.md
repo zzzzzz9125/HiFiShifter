@@ -4,4 +4,5 @@
 - [ ] 体验优化：添加自动保存功能
 - [ ] 功能增加：抽象声码器模块，增加对pyworld以及vsh算法的支持
 - [ ] 功能增加：提供对共振峰、音量包络的修改支持
-- [ ] 功能增加：[研究尝试张力参数支持](https://github.com/DSP-8192/VocalTensionController)
+- [x] 功能增加：[研究尝试张力参数支持](https://github.com/DSP-8192/VocalTensionController)
+- [ ] 功能验证：验证张力参数的合成情况
