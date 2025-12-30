@@ -16,3 +16,5 @@ torchmetrics
 praat-parselmouth
 pyworld
 lightning
+torchcodec
+ffmpeg

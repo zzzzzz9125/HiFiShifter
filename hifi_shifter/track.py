@@ -18,6 +18,8 @@ class Track:
         self.mel = None
         self.f0_original = None
         self.f0_edited = None
+        # Per-frame tension curve aligned to f0_edited (range: -100..100)
+        self.tension_edited = None
         self.segments = []
         self.segment_states = [] # List of dicts: {'dirty': bool, 'audio': np.array}
         
@@ -32,6 +34,15 @@ class Track:
         # Undo/Redo
         self.undo_stack = []
         self.redo_stack = []
+        self.tension_undo_stack = []
+        self.tension_redo_stack = []
+
+        # Caches / versions
+        self.tension_version = 0
+        self.synth_version = 0
+        self._tension_processed_audio = None
+        self._tension_processed_key = None
+
 
     def load(self, processor):
         """
@@ -43,8 +54,15 @@ class Track:
             if self.track_type == 'vocal':
                 self.audio, self.sr, self.mel, self.f0_original, self.segments = processor.process_audio(self.file_path)
                 self.f0_edited = self.f0_original.copy()
+                # Initialize tension as neutral (0) aligned to f0
+                self.tension_edited = np.zeros_like(self.f0_edited, dtype=np.float32)
+                self.tension_version = 0
+                self.synth_version = 0
+                self._tension_processed_audio = None
+                self._tension_processed_key = None
 
                 # Initialize segment states
+
                 self.segment_states = []
                 for _ in self.segments:
                     self.segment_states.append({'dirty': True, 'audio': None})
@@ -155,3 +173,9 @@ class Track:
         
         # Ensure start_frame is always an integer
         self.start_frame = int(self.start_frame) if self.start_frame is not None else 0
+
+        # Invalidate post-FX cache whenever synthesis output updates
+        self.synth_version += 1
+        self._tension_processed_audio = None
+        self._tension_processed_key = None
+
