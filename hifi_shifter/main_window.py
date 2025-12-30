@@ -6,14 +6,17 @@ import pathlib
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wavfile
+import traceback
+import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QMessageBox, QComboBox, QDoubleSpinBox, QSpinBox,
                              QButtonGroup, QSplitter, QScrollBar, QGraphicsRectItem,
                              QProgressBar, QAbstractSpinBox)
 from PyQt6.QtGui import QAction, QKeySequence, QPen, QColor, QBrush, QShortcut, QActionGroup, QIcon
-from PyQt6.QtCore import Qt, QTimer, QRectF
+from PyQt6.QtCore import Qt, QTimer, QRectF, QObject, QThread, pyqtSignal
 import pyqtgraph as pg
+
 
 # Import widgets
 from .widgets import CustomViewBox, PianoRollAxis, BPMAxis, MusicGridItem, PlaybackCursorItem
@@ -28,6 +31,34 @@ from . import config_manager
 from . import theme
 # Import I18n
 from utils.i18n import i18n
+
+
+class _BackgroundTask(QObject):
+    """Run a callable in a QThread and report back via Qt signals.
+
+    Important: the callable MUST NOT touch Qt widgets directly.
+    """
+
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # current, total
+
+    def __init__(self, fn, *, total: int | None = None):
+        super().__init__()
+        self._fn = fn
+        self._total = total
+
+    def run(self):
+        try:
+            def _progress(cur: int, total: int | None = None):
+                t = int(total if total is not None else (self._total if self._total is not None else 0))
+                self.progress.emit(int(cur), t)
+
+            result = self._fn(_progress)
+            self.finished.emit(result)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
 
 class HifiShifterGUI(QMainWindow):
     def __init__(self):
@@ -79,8 +110,28 @@ class HifiShifterGUI(QMainWindow):
         self.playback_timer = QTimer()
         self.playback_timer.setInterval(30) # 30ms update
         self.playback_timer.timeout.connect(self.update_cursor)
-        
+
+        # Real-time playback stream state (so volume/mute/solo changes apply during playback)
+        self._playback_stream = None
+        self._playback_lock = threading.RLock()
+        self._playback_items = []  # list[(Track, np.ndarray(float32), start_sample)]
+        self._playback_sample_pos = 0
+        self._playback_total_samples = 0
+        self._playback_sr = 44100
+        self._playback_hop_size = 512
+
+        # Background task state (keep heavy work off the UI thread)
+        self._bg_thread: QThread | None = None
+
+        self._bg_task: _BackgroundTask | None = None
+        self._bg_kind: str | None = None
+        self._pending_track_paths: list[str] = []
+        self._pending_synthesis: bool = False
+        self._pending_playback: bool = False
+
+
         # Undo/Redo Stacks (Global or per track? Per track is better but harder. Let's keep global for now, but it needs to track which track was edited)
+
         # Actually, let's make undo/redo per track, or clear it when switching tracks.
         # For simplicity, let's clear undo stack when switching tracks for now.
         self.undo_stack = []
@@ -757,121 +808,482 @@ class HifiShifterGUI(QMainWindow):
         else:
             self.start_playback()
 
-    def start_playback(self):
-        # Auto-synthesize if needed
-        self.synthesize_audio_only()
+    def _is_bg_busy(self) -> bool:
+        return self._bg_thread is not None and self._bg_thread.isRunning()
+
+    def _set_bg_locked(self, locked: bool):
+        """Disable interactive UI while a background task is running.
+
+        This avoids race conditions where the UI reads/writes track data while
+        synthesis/loading/export is mutating it.
+        """
+        for attr in (
+            'mode_combo',
+            'param_combo',
+            'btn_param_pitch',
+            'btn_param_tension',
+            'timeline_panel',
+        ):
+            w = getattr(self, attr, None)
+            try:
+                if w is not None:
+                    w.setEnabled(not locked)
+            except Exception:
+                pass
+
+    def _on_bg_progress(self, cur: int, total: int):
+        try:
+            if total and total > 0:
+                self.progress_bar.setRange(0, max(1, int(total)))
+                self.progress_bar.setValue(int(cur))
+            else:
+                # Busy indicator
+                self.progress_bar.setRange(0, 0)
+            self.progress_bar.setVisible(True)
+        except Exception:
+            pass
+
+    def _start_bg_task(self, *, kind: str, status_text: str, fn, total: int | None = None, on_success=None, on_failed=None) -> bool:
+        if self._is_bg_busy():
+            return False
+
+        self._bg_kind = kind
+        self.status_label.setText(status_text)
+        self.progress_bar.setVisible(True)
+        if total is None:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, max(1, int(total)))
+            self.progress_bar.setValue(0)
+
+        self._set_bg_locked(True)
+
+        thread = QThread(self)
+        task = _BackgroundTask(fn, total=total)
+        task.moveToThread(thread)
+
+        task.progress.connect(self._on_bg_progress)
+
+        def _finish_common():
+            try:
+                self.progress_bar.setVisible(False)
+            except Exception:
+                pass
+            self._set_bg_locked(False)
+            self._bg_kind = None
+            self._bg_task = None
+            self._bg_thread = None
+
+            # If playback was requested during a background task, resume now.
+            if getattr(self, '_pending_playback', False):
+                self._pending_playback = False
+                try:
+                    self.start_playback()
+                except Exception:
+                    pass
+
+
+        def _on_success(result):
+            try:
+                if on_success is not None:
+                    on_success(result)
+            finally:
+                _finish_common()
+
+        def _on_failed(err_text: str):
+            try:
+                print(err_text)
+                if on_failed is not None:
+                    on_failed(err_text)
+            finally:
+                _finish_common()
+
+        task.finished.connect(_on_success)
+        task.failed.connect(_on_failed)
+
+        thread.started.connect(task.run)
+        task.finished.connect(thread.quit)
+        task.failed.connect(thread.quit)
+        thread.finished.connect(task.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._bg_thread = thread
+        self._bg_task = task
+        thread.start()
+        return True
+
+    def _count_dirty_segments(self) -> int:
+        total = 0
+        for track in self.tracks:
+            if getattr(track, 'track_type', None) != 'vocal':
+                continue
+            for state in getattr(track, 'segment_states', []) or []:
+                if state.get('dirty'):
+                    total += 1
+        return total
+
+    def _has_dirty_segments(self) -> bool:
+        return self._count_dirty_segments() > 0
+
+    def synthesize_audio_async(self, *, after=None):
+        """Synthesize dirty segments in a background thread.
+
+        `after` will be called on the UI thread after synthesis finishes.
+        """
+        total_segments = self._count_dirty_segments()
+        if total_segments <= 0:
+            if after is not None:
+                after()
+            return
+
+        if self._is_bg_busy():
+            # Coalesce repeated requests (e.g. multiple clicks)
+            self._pending_synthesis = True
+            return
+
+        # Stop playback while mutating track audio buffers
+        try:
+            if self.is_playing:
+                self.stop_playback(reset=False)
+        except Exception:
+            pass
+
+        def _work(progress):
+            hop_size = self.processor.config['hop_size'] if self.processor.config else 512
+            processed = 0
+            for track in self.tracks:
+                if track.track_type != 'vocal':
+                    continue
+                for i, state in enumerate(track.segment_states):
+                    if state.get('dirty'):
+                        track.synthesize_segment(self.processor, i)
+                        processed += 1
+                        progress(processed, total_segments)
+                track.update_full_audio(hop_size)
+            return processed
+
+        def _ok(_processed_count):
+            self.status_label.setText(i18n.get("status.synthesis_complete"))
+
+            if self._pending_synthesis:
+                self._pending_synthesis = False
+                # Re-run once more to pick up new dirty segments
+                self.synthesize_audio_async(after=after)
+                return
+
+            if after is not None:
+                after()
+
+        def _fail(_err_text: str):
+            self.status_label.setText(i18n.get("status.auto_synthesis_failed"))
+
+        self._start_bg_task(
+            kind='synthesize',
+            status_text=i18n.get("status.synthesizing"),
+            fn=_work,
+            total=total_segments,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
+    def _close_playback_stream(self):
+        stream = getattr(self, '_playback_stream', None)
+        self._playback_stream = None
+
+        if stream is None:
+            return
 
         try:
-            if not self.tracks:
-                return
+            stream.stop()
+        except Exception:
+            pass
 
-            if not self.is_playing:
-                self.playback_start_time = self.current_playback_time
+        try:
+            stream.close()
+        except Exception:
+            pass
 
-            # Mix audio
-            mixed_audio = self.mix_tracks()
-            if mixed_audio is None:
-                return
-            
-            sr = self.processor.config['audio_sample_rate'] if self.processor.config else 44100
-            total_duration = len(mixed_audio) / sr
-            
-            if self.current_playback_time >= total_duration:
-                self.current_playback_time = 0
-                self.play_cursor.setValue(0)
-            
-            start_sample = int(self.current_playback_time * sr)
-            audio_to_play = mixed_audio[start_sample:]
-            
-            if len(audio_to_play) == 0:
-                self.current_playback_time = 0
-                self.play_cursor.setValue(0)
-                audio_to_play = mixed_audio
-            
-            sd.play(audio_to_play, sr)
-            self.is_playing = True
-            self.last_wall_time = time.time()
-            self.playback_timer.start()
-            self.status_label.setText(i18n.get("status.playing"))
-            
+    def _on_stream_finished(self):
+        """Called on the UI thread when the sounddevice stream finishes."""
+        try:
+            self._close_playback_stream()
+        except Exception:
+            pass
+
+        if self.is_playing:
+            self.is_playing = False
+            self.playback_timer.stop()
+            self.status_label.setText(i18n.get("status.stopped"))
+
+    def _prepare_stream_playback_async(self):
+        """Prepare per-track float32 buffers for callback mixing in a background thread."""
+        if self._is_bg_busy():
+            return
+
+        def _work(_progress):
+            sr = int(self.processor.config['audio_sample_rate']) if self.processor.config else 44100
+            hop_size = int(self.processor.config['hop_size']) if self.processor.config else 512
+
+            items = []
+            max_len = 0
+
+            for track in self.tracks:
+                audio = self._get_track_audio_for_mix(track)
+                if audio is None:
+                    continue
+                if len(audio) <= 0:
+                    continue
+                if audio.dtype != np.float32:
+                    audio = audio.astype(np.float32)
+                audio = np.ascontiguousarray(audio)
+
+                start_sample = int(track.start_frame) * hop_size
+                end_sample = start_sample + int(len(audio))
+                if end_sample > max_len:
+                    max_len = end_sample
+
+                items.append((track, audio, start_sample))
+
+            if max_len <= 0 or not items:
+                return None
+
+            return {
+                'sr': sr,
+                'hop_size': hop_size,
+                'total_samples': int(max_len),
+                'items': items,
+            }
+
+        def _ok(prep):
+            self._start_stream_playback(prep)
+
+        def _fail(_err_text: str):
+            self.status_label.setText(i18n.get("status.load_failed"))
+
+        self._start_bg_task(
+            kind='prepare_playback',
+            status_text=i18n.get("status.mixing"),
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
+    def _start_stream_playback(self, prep):
+        if prep is None:
+            return
+
+        # Stop any existing playback first
+        try:
+            self._close_playback_stream()
+        except Exception:
+            pass
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
+        sr = int(prep.get('sr', 44100))
+        hop_size = int(prep.get('hop_size', 512))
+        total_samples = int(prep.get('total_samples', 0))
+        items = prep.get('items', [])
+
+        if total_samples <= 0 or not items:
+            return
+
+        # Mark where "stop(reset=False)" returns to
+        self.playback_start_time = self.current_playback_time
+
+        if self.current_playback_time < 0:
+            self.current_playback_time = 0.0
+
+        start_sample = int(self.current_playback_time * sr)
+        if start_sample >= total_samples:
+            start_sample = 0
+            self.current_playback_time = 0.0
+            self.play_cursor.setValue(0)
+
+        self._playback_sr = sr
+        self._playback_hop_size = hop_size
+        self._playback_total_samples = total_samples
+        self._playback_items = items
+        with self._playback_lock:
+            self._playback_sample_pos = int(start_sample)
+
+        def _finished_callback():
+            # sounddevice thread -> marshal to UI thread
+            try:
+                QTimer.singleShot(0, self._on_stream_finished)
+            except Exception:
+                pass
+
+        def _callback(outdata, frames, _time_info, _status):
+            outdata.fill(0)
+
+            with self._playback_lock:
+                pos = int(self._playback_sample_pos)
+                total = int(self._playback_total_samples)
+
+            if total <= 0 or pos >= total:
+                raise sd.CallbackStop()
+
+            n_avail = total - pos
+            n = frames if frames <= n_avail else n_avail
+            if n <= 0:
+                raise sd.CallbackStop()
+
+            items_local = self._playback_items
+
+            # If any track is solo, only solo tracks are audible.
+            solo_any = False
+            for t, _buf, _start in items_local:
+                if getattr(t, 'solo', False):
+                    solo_any = True
+                    break
+
+            mix = np.zeros(n, dtype=np.float32)
+
+            for t, buf, start in items_local:
+                if getattr(t, 'muted', False):
+                    continue
+                if solo_any and (not getattr(t, 'solo', False)):
+                    continue
+
+                vol = float(getattr(t, 'volume', 1.0))
+                if vol == 0.0:
+                    continue
+
+                src0 = pos - int(start)
+
+                # No overlap with this output block
+                if src0 >= len(buf) or src0 + n <= 0:
+                    continue
+
+                out0 = 0
+                if src0 < 0:
+                    out0 = -src0
+                    src0 = 0
+
+                take = min(n - out0, len(buf) - src0)
+                if take <= 0:
+                    continue
+
+                mix[out0:out0 + take] += buf[src0:src0 + take] * vol
+
+            np.clip(mix, -1.0, 1.0, out=mix)
+            outdata[:n, 0] = mix
+
+            with self._playback_lock:
+                self._playback_sample_pos += int(n)
+
+            if n < frames:
+                raise sd.CallbackStop()
+
+        try:
+            self._playback_stream = sd.OutputStream(
+                samplerate=sr,
+                channels=1,
+                dtype='float32',
+                callback=_callback,
+                finished_callback=_finished_callback,
+            )
+            self._playback_stream.start()
         except Exception as e:
             print(f"Playback error: {e}")
-            self.stop_playback()
+            self._close_playback_stream()
+            return
 
-    def synthesize_audio_only(self):
-        """Helper to synthesize all dirty tracks"""
-        try:
-            self.status_label.setText(i18n.get("status.synthesizing"))
-            
-            # Count total dirty segments
-            total_segments = 0
-            for track in self.tracks:
-                if track.track_type == 'vocal':
-                    for state in track.segment_states:
-                        if state['dirty']:
-                            total_segments += 1
-            
-            self.progress_bar.setRange(0, total_segments if total_segments > 0 else 1)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setVisible(True)
-            QApplication.processEvents()
-            
-            hop_size = self.processor.config['hop_size'] if self.processor.config else 512
-            
-            processed_count = 0
-            for track in self.tracks:
-                if track.track_type == 'vocal':
-                    # Check dirty segments
-                    for i, state in enumerate(track.segment_states):
-                        if state['dirty']:
-                            track.synthesize_segment(self.processor, i)
-                            processed_count += 1
-                            self.progress_bar.setValue(processed_count)
-                            QApplication.processEvents()
-                    
-                    # Update full audio buffer for the track
-                    track.update_full_audio(hop_size)
-            
-            self.status_label.setText(i18n.get("status.synthesis_complete"))
-        except Exception as e:
-            print(f"Auto-synthesis failed: {e}")
-            import traceback
-            traceback.print_exc()
-            self.status_label.setText(i18n.get("status.auto_synthesis_failed"))
-        finally:
-            self.progress_bar.setVisible(False)
+        self.is_playing = True
+        self.playback_timer.start()
+        self.status_label.setText(i18n.get("status.playing"))
+
+    def start_playback(self):
+        # Ensure synthesis happens off the UI thread; playback itself is stream/callback mixed.
+        if not self.tracks:
+            return
+
+        if self._is_bg_busy():
+            self._pending_playback = True
+            return
+
+        if self._has_dirty_segments():
+            self.synthesize_audio_async(after=self.start_playback)
+            return
+
+        self._prepare_stream_playback_async()
 
     def pause_playback(self):
-        if not self.is_playing: return
-        
-        sd.stop()
+        if not self.is_playing:
+            return
+
+        try:
+            sr = int(self._playback_sr) if getattr(self, '_playback_sr', None) else 44100
+            with self._playback_lock:
+                self.current_playback_time = float(self._playback_sample_pos) / float(sr)
+        except Exception:
+            pass
+
+        try:
+            self._close_playback_stream()
+        except Exception:
+            pass
+
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
         self.is_playing = False
         self.playback_timer.stop()
-        
-        # Update current time one last time
-        now = time.time()
-        self.current_playback_time += now - self.last_wall_time
         self.status_label.setText(i18n.get("status.paused"))
 
     def stop_playback(self, reset=False):
-        sd.stop()
+        try:
+            sr = int(self._playback_sr) if getattr(self, '_playback_sr', None) else 44100
+            with self._playback_lock:
+                self.current_playback_time = float(self._playback_sample_pos) / float(sr)
+        except Exception:
+            pass
+
+        try:
+            self._close_playback_stream()
+        except Exception:
+            pass
+
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
         self.is_playing = False
         self.playback_timer.stop()
-        
+
         if reset:
             self.current_playback_time = 0
+            try:
+                with self._playback_lock:
+                    self._playback_sample_pos = 0
+            except Exception:
+                pass
             self.play_cursor.setValue(0)
             self.playback_start_time = 0
         else:
             # Return to start position
             self.current_playback_time = self.playback_start_time
+            try:
+                with self._playback_lock:
+                    self._playback_sample_pos = int(self.current_playback_time * sr)
+            except Exception:
+                pass
+
             if self.processor.config:
                 hop_size = self.processor.config['hop_size']
-                sr = self.processor.config.get('audio_sample_rate', 44100)
-                self.play_cursor.setValue(self.current_playback_time * sr / hop_size)
-                self.timeline_panel.set_cursor_position(self.current_playback_time * sr / hop_size)
-                
+                sr_cfg = self.processor.config.get('audio_sample_rate', 44100)
+                self.play_cursor.setValue(self.current_playback_time * sr_cfg / hop_size)
+                self.timeline_panel.set_cursor_position(self.current_playback_time * sr_cfg / hop_size)
+
         self.status_label.setText(i18n.get("status.stopped"))
+
 
     def set_playback_position(self, x_frame):
         if x_frame < 0: x_frame = 0
@@ -892,38 +1304,32 @@ class HifiShifterGUI(QMainWindow):
                 self.pause_playback()
 
     def update_cursor(self):
-        if not self.is_playing: return
-        
-        now = time.time()
-        dt = now - self.last_wall_time
-        self.last_wall_time = now
-        
-        self.current_playback_time += dt
-        
+        if not self.is_playing:
+            return
+
+        # When using OutputStream callback playback, derive time from sample position.
+        if getattr(self, '_playback_stream', None) is not None:
+            try:
+                sr = int(self._playback_sr) if getattr(self, '_playback_sr', None) else 44100
+                with self._playback_lock:
+                    self.current_playback_time = float(self._playback_sample_pos) / float(sr)
+            except Exception:
+                pass
+        else:
+            # Fallback (should rarely happen now)
+            now = time.time()
+            dt = now - self.last_wall_time
+            self.last_wall_time = now
+            self.current_playback_time += dt
+
         # Convert time to x (frames)
-        # x = time * sr / hop_size
         if self.processor.config:
             hop_size = self.processor.config['hop_size']
-            sr = self.processor.config.get('audio_sample_rate', 44100)
-            x = self.current_playback_time * sr / hop_size
+            sr_cfg = self.processor.config.get('audio_sample_rate', 44100)
+            x = self.current_playback_time * sr_cfg / hop_size
             self.play_cursor.setValue(x)
             self.timeline_panel.set_cursor_position(x)
-            
-            # Auto scroll if cursor goes out of view?
-            # view_range = self.plot_widget.viewRange()[0]
-            # if x > view_range[1]:
-            #     self.plot_widget.plotItem.vb.translateBy(x - view_range[0])
 
-        # Check if finished
-        # Note: synthesized_audio is now per track, but we might have a mixed buffer?
-        # Actually, start_playback mixes audio. We don't store mixed audio in self.synthesized_audio anymore?
-        # Wait, start_playback plays directly.
-        # We need to check if playback is done.
-        # Since we use sounddevice, we can just check if we are past the end.
-        # But we don't know the total length easily here unless we store it.
-        # Let's just rely on user stopping or loop?
-        # Or better, check against the longest track.
-        pass
 
     def update_views(self):
         self.waveform_view.setGeometry(self.plot_widget.plotItem.vb.sceneBoundingRect())
@@ -958,23 +1364,37 @@ class HifiShifterGUI(QMainWindow):
                 self.load_model(folder_path)
 
     def load_model(self, folder):
-        try:
-            self.status_label.setText(i18n.get("status.loading_model") + f" {folder}...")
-            self.progress_bar.setRange(0, 0) # Busy indicator
-            self.progress_bar.setVisible(True)
-            QApplication.processEvents()
-            
+        if self._is_bg_busy():
+            return
+
+        def _work(_progress):
             self.processor.load_model(folder)
+            return folder
+
+        def _ok(_folder):
             self.model_path = folder
-            
             self.status_label.setText(i18n.get("status.model_loaded") + f": {pathlib.Path(folder).name}")
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.load_model_failed") + f": {str(e)}")
+
+            # Update timeline hop_size if possible
+            try:
+                if self.processor.config and hasattr(self, 'timeline_panel'):
+                    self.timeline_panel.hop_size = self.processor.config['hop_size']
+            except Exception:
+                pass
+
+        def _fail(err_text: str):
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.load_model_failed") + f":\n{err_text}")
             self.status_label.setText(i18n.get("status.model_load_failed"))
-        finally:
-            self.progress_bar.setVisible(False)
-            self.progress_bar.setRange(0, 100)
+
+        self._start_bg_task(
+            kind='load_model',
+            status_text=i18n.get("status.loading_model") + f" {folder}...",
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
 
     def load_audio_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(self, i18n.get("dialog.select_audio"), "", i18n.get("filter.audio_files"))
@@ -988,31 +1408,61 @@ class HifiShifterGUI(QMainWindow):
     def add_track_from_file(self, file_path):
         if not os.path.exists(file_path):
             return
-            
+
+        # If a background task is running, queue the request.
+        if self._is_bg_busy():
+            self._pending_track_paths.append(file_path)
+            try:
+                self.status_label.setText(i18n.get("status.loading_track") + f" {os.path.basename(file_path)}... (queued)")
+            except Exception:
+                pass
+            return
+
         name = os.path.basename(file_path)
-        # Default to vocal
-        track = Track(name, file_path, track_type='vocal')
-        
-        try:
-            self.status_label.setText(i18n.get("status.loading_track") + f" {name}...")
-            QApplication.processEvents()
-            
+
+        def _work(_progress):
+            track = Track(name, file_path, track_type='vocal')
             track.load(self.processor)
+            return track
+
+        def _continue_queue():
+            if self._pending_track_paths:
+                next_path = self._pending_track_paths.pop(0)
+                self.add_track_from_file(next_path)
+
+        def _ok(track: Track):
             self.tracks.append(track)
-            
+
             # Update Timeline
-            self.timeline_panel.hop_size = self.processor.config['hop_size']
+            try:
+                if self.processor.config:
+                    self.timeline_panel.hop_size = self.processor.config['hop_size']
+            except Exception:
+                pass
+
             self.timeline_panel.refresh_tracks(self.tracks)
             self.timeline_panel.select_track(len(self.tracks) - 1)
-            
+
             # Trigger selection logic manually since select_track doesn't emit signal
             self.on_track_selected(len(self.tracks) - 1)
-            
+
             self.status_label.setText(i18n.get("status.track_loaded") + f": {name}")
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.load_track_failed") + f": {e}")
+            _continue_queue()
+
+        def _fail(err_text: str):
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.load_track_failed") + f":\n{err_text}")
             self.status_label.setText(i18n.get("status.load_failed"))
+            _continue_queue()
+
+        self._start_bg_task(
+            kind='add_track',
+            status_text=i18n.get("status.loading_track") + f" {name}...",
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
 
     def on_track_selected(self, index):
         self.current_track_idx = index
@@ -1048,26 +1498,43 @@ class HifiShifterGUI(QMainWindow):
         # track is the Track object passed from signal
         if track.track_type == new_type:
             return
-            
+
+        if self._is_bg_busy():
+            return
+
         track.track_type = new_type
-        # Reload
-        try:
-            self.status_label.setText(i18n.get("status.reloading_track") + f" {track.name}...")
-            QApplication.processEvents()
+
+        def _work(_progress):
             track.load(self.processor)
+            return track
+
+        def _ok(_track):
             self.status_label.setText(i18n.get("status.reloaded") + f": {track.name}")
-            
             self.update_plot()
-            
+
             # Update Timeline
-            self.timeline_panel.hop_size = self.processor.config['hop_size']
+            try:
+                if self.processor.config:
+                    self.timeline_panel.hop_size = self.processor.config['hop_size']
+            except Exception:
+                pass
+
             self.timeline_panel.refresh_tracks(self.tracks)
             self.timeline_panel.select_track(self.current_track_idx)
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.reload_track_failed") + f": {e}")
 
+        def _fail(err_text: str):
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.reload_track_failed") + f":\n{err_text}")
             self.status_label.setText(i18n.get("status.audio_load_failed"))
+
+        self._start_bg_task(
+            kind='reload_track',
+            status_text=i18n.get("status.reloading_track") + f" {track.name}...",
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
 
     def _get_track_audio_for_mix(self, track: Track):
         """Return audio buffer for mixing/export, applying tension post-FX for vocal tracks."""
@@ -1146,70 +1613,70 @@ class HifiShifterGUI(QMainWindow):
 
 
     def export_audio_dialog(self):
-        # Ensure everything is synthesized
-        self.synthesize_audio_only()
-        
+        # Ensure everything is synthesized (async) before exporting
+        if self._has_dirty_segments():
+            self.synthesize_audio_async(after=self.export_audio_dialog)
+            return
+
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle(i18n.get("dialog.export_audio"))
         msg_box.setText(i18n.get("msg.select_export_mode"))
-        
+
         btn_mixed = msg_box.addButton(i18n.get("btn.export_mixed"), QMessageBox.ButtonRole.AcceptRole)
         btn_separated = msg_box.addButton(i18n.get("btn.export_separated"), QMessageBox.ButtonRole.AcceptRole)
         btn_cancel = msg_box.addButton(i18n.get("btn.cancel"), QMessageBox.ButtonRole.RejectRole)
-        
+
         msg_box.exec()
-        
+
         clicked_button = msg_box.clickedButton()
-        
         if clicked_button == btn_cancel:
             return
-            
+
         if clicked_button == btn_mixed:
-            mixed_audio = self.mix_tracks()
-            if mixed_audio is None:
-                QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.no_audio_to_export"))
-                return
-                
             file_path, _ = QFileDialog.getSaveFileName(self, i18n.get("dialog.export_mixed"), "output.wav", "WAV Audio (*.wav)")
             if file_path:
-                self.export_audio(file_path, mixed_audio)
-                
+                self.export_audio(file_path)
+
         elif clicked_button == btn_separated:
             dir_path = QFileDialog.getExistingDirectory(self, i18n.get("dialog.select_export_dir"))
             if dir_path:
                 self.export_separated_tracks(dir_path)
 
     def export_separated_tracks(self, dir_path):
-        count = 0
-        try:
+        """Export all active vocal tracks to separate WAV files (background thread)."""
+        if self._is_bg_busy():
+            return
+
+        # Estimate total export count for progress
+        total = 0
+        for track in self.tracks:
+            if track.track_type == 'vocal' and not track.muted and track.synthesized_audio is not None:
+                total += 1
+
+        def _work(progress):
+            count = 0
             sr = self.processor.config['audio_sample_rate'] if self.processor.config else 44100
             hop_size = self.processor.config['hop_size'] if self.processor.config else 512
-            
+
             for i, track in enumerate(self.tracks):
-                # Skip muted tracks and BGM tracks
                 if track.muted or track.track_type == 'bgm':
                     continue
-                
                 if track.synthesized_audio is None:
                     continue
-                    
-                # Construct file name
+
                 safe_name = "".join([c for c in track.name if c.isalnum() or c in (' ', '-', '_')]).strip()
                 if not safe_name:
                     safe_name = f"track_{i+1}"
-                
+
                 file_path = os.path.join(dir_path, f"{safe_name}.wav")
-                
+
                 audio = self._get_track_audio_for_mix(track)
                 if audio is None:
                     continue
                 if audio.dtype != np.float32:
                     audio = audio.astype(np.float32)
 
-                
-                # Handle start_frame offset
                 start_sample = track.start_frame * hop_size
-                
                 if start_sample > 0:
                     pad = np.zeros(start_sample, dtype=np.float32)
                     audio_to_save = np.concatenate((pad, audio))
@@ -1221,134 +1688,178 @@ class HifiShifterGUI(QMainWindow):
                         audio_to_save = np.array([], dtype=np.float32)
                 else:
                     audio_to_save = audio
-                    
+
                 wavfile.write(file_path, sr, audio_to_save)
                 count += 1
-            
-            QMessageBox.information(self, i18n.get("msg.success"), i18n.get("msg.export_separated_success").format(count, dir_path))
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.export_failed") + f": {str(e)}")
+                progress(count, total)
 
-    def export_audio(self, file_path, audio):
-        try:
-            self.status_label.setText(i18n.get("status.exporting") + f" {file_path}...")
-            QApplication.processEvents()
-            
-            if audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
-            
+            return count
+
+        def _ok(count: int):
+            QMessageBox.information(self, i18n.get("msg.success"), i18n.get("msg.export_separated_success").format(count, dir_path))
+
+        def _fail(_err_text: str):
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.export_failed"))
+
+        self._start_bg_task(
+            kind='export_separated',
+            status_text=i18n.get("status.exporting") + f" {dir_path}...",
+            fn=_work,
+            total=total if total > 0 else None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
+    def export_audio(self, file_path):
+        """Export mixed audio to a single WAV file (background thread)."""
+        if self._is_bg_busy():
+            return
+
+        def _work(_progress):
+            mixed_audio = self.mix_tracks()
+            if mixed_audio is None:
+                return None
+
+            if mixed_audio.dtype != np.float32:
+                mixed_audio = mixed_audio.astype(np.float32)
+
             sr = self.processor.config['audio_sample_rate'] if self.processor.config else 44100
-            wavfile.write(file_path, sr, audio)
-            
-            self.status_label.setText(i18n.get("status.export_success") + f": {file_path}")
-            QMessageBox.information(self, i18n.get("msg.success"), i18n.get("msg.export_success") + f":\n{file_path}")
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.export_failed") + f": {str(e)}")
+            wavfile.write(file_path, sr, mixed_audio)
+            return file_path
+
+        def _ok(result_path):
+            if result_path is None:
+                QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.no_audio_to_export"))
+                return
+            self.status_label.setText(i18n.get("status.export_success") + f": {result_path}")
+            QMessageBox.information(self, i18n.get("msg.success"), i18n.get("msg.export_success") + f":\n{result_path}")
+
+        def _fail(_err_text: str):
             self.status_label.setText(i18n.get("status.export_failed"))
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.export_failed"))
+
+        self._start_bg_task(
+            kind='export_mixed',
+            status_text=i18n.get("status.exporting") + f" {file_path}...",
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
 
     def open_project_dialog(self):
+
         file_path, _ = QFileDialog.getOpenFileName(self, i18n.get("menu.file.open"), "", "HifiShifter Project (*.hsp *.json)")
         if file_path:
             self.open_project(file_path)
 
     def open_project(self, file_path):
+        if self._is_bg_busy():
+            return
+
+        # Clear current UI state quickly (UI thread)
         try:
-            project_dir = os.path.dirname(os.path.abspath(file_path))
-            
+            self.stop_playback(reset=True)
+        except Exception:
+            pass
+
+        self.tracks = []
+        self.current_track_idx = -1
+        try:
+            self.timeline_panel.refresh_tracks(self.tracks)
+        except Exception:
+            pass
+        self.clear_selection(hide_box=True)
+        self.update_plot()
+
+        project_dir = os.path.dirname(os.path.abspath(file_path))
+
+        def _work(progress):
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            # Clear current
-            self.tracks = []
-            # self.track_list.clear() # Removed in refactor
-            self.current_track_idx = -1
-            # self.plot_widget.clear() # This is the editor plot, handled by update_plot
-            # self.timeline_widget.clear() # Renamed to timeline_panel
-            
-            # Load Model
+
+            # Resolve & load model (heavy)
+            loaded_model_path = None
             model_path = data.get('model_path')
             if model_path:
-                # Check absolute
                 if not os.path.exists(model_path):
-                    # Check relative
                     rel_path = os.path.join(project_dir, model_path)
                     if os.path.exists(rel_path):
                         model_path = rel_path
-                
+
                 if os.path.exists(model_path):
-                    self.load_model(model_path)
-                else:
-                    QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.model_not_found") + f": {model_path}")
-            
-            # Restore Parameters
-            if 'params' in data:
-                params = data['params']
-                if 'bpm' in params: self.bpm_spin.setValue(params['bpm'])
-                if 'beats' in params: self.beats_spin.setValue(params['beats'])
-            
-            # Load Tracks
+                    # Direct call to avoid spawning nested background tasks
+                    self.processor.load_model(model_path)
+                    loaded_model_path = model_path
+
+            params = data.get('params', {}) if isinstance(data, dict) else {}
+
+            tracks: list[Track] = []
+            missing_audio: list[str] = []
+
             if 'tracks' in data:
-                for t_data in data['tracks']:
-                    file_p = t_data['file_path']
-                    # Resolve path
+                t_list = data.get('tracks') or []
+                total = len(t_list)
+                for idx, t_data in enumerate(t_list):
+                    file_p = t_data.get('file_path')
+                    if not file_p:
+                        continue
+
                     if not os.path.exists(file_p):
                         rel_p = os.path.join(project_dir, file_p)
                         if os.path.exists(rel_p):
                             file_p = rel_p
-                    
-                    if os.path.exists(file_p):
-                        track = Track(t_data['name'], file_p, t_data.get('type', 'vocal'))
-                        track.load(self.processor)
-                        
-                        track.shift_value = t_data.get('shift', 0.0)
-                        track.muted = t_data.get('muted', False)
-                        track.solo = t_data.get('solo', False)
-                        track.volume = t_data.get('volume', 1.0)
-                        track.start_frame = t_data.get('start_frame', 0)
-                        
-                        if 'f0' in t_data and track.f0_edited is not None:
-                            saved_f0 = np.array(t_data['f0'])
-                            # Handle length mismatch if audio changed slightly or different decoding
-                            min_len = min(len(saved_f0), len(track.f0_edited))
-                            track.f0_edited[:min_len] = saved_f0[:min_len]
-                                
-                            # Mark dirty
-                            for state in track.segment_states:
-                                state['dirty'] = True
 
-                        if 'tension' in t_data and getattr(track, 'tension_edited', None) is not None:
-                            saved_tension = np.array(t_data['tension'], dtype=np.float32)
-                            min_len = min(len(saved_tension), len(track.tension_edited))
-                            track.tension_edited[:min_len] = saved_tension[:min_len]
-                            track.tension_version += 1
-                            track._tension_processed_audio = None
-                            track._tension_processed_key = None
+                    if not os.path.exists(file_p):
+                        missing_audio.append(str(file_p))
+                        progress(idx + 1, total)
+                        continue
 
-                        
-                        self.tracks.append(track)
-                    else:
-                         QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.audio_not_found") + f": {file_p}")
-            
+                    track = Track(t_data.get('name', os.path.basename(file_p)), file_p, t_data.get('type', 'vocal'))
+                    track.load(self.processor)
+
+                    track.shift_value = t_data.get('shift', 0.0)
+                    track.muted = t_data.get('muted', False)
+                    track.solo = t_data.get('solo', False)
+                    track.volume = t_data.get('volume', 1.0)
+                    track.start_frame = t_data.get('start_frame', 0)
+
+                    if 'f0' in t_data and track.f0_edited is not None:
+                        saved_f0 = np.array(t_data['f0'])
+                        min_len = min(len(saved_f0), len(track.f0_edited))
+                        track.f0_edited[:min_len] = saved_f0[:min_len]
+                        for state in track.segment_states:
+                            state['dirty'] = True
+
+                    if 'tension' in t_data and getattr(track, 'tension_edited', None) is not None:
+                        saved_tension = np.array(t_data['tension'], dtype=np.float32)
+                        min_len = min(len(saved_tension), len(track.tension_edited))
+                        track.tension_edited[:min_len] = saved_tension[:min_len]
+                        track.tension_version += 1
+                        track._tension_processed_audio = None
+                        track._tension_processed_key = None
+
+                    tracks.append(track)
+                    progress(idx + 1, total)
+
             # Backward compatibility for v1.0
             elif 'audio_path' in data:
                 audio_path = data['audio_path']
                 if not os.path.exists(audio_path):
-                     rel_p = os.path.join(project_dir, audio_path)
-                     if os.path.exists(rel_p):
-                         audio_path = rel_p
-                
+                    rel_p = os.path.join(project_dir, audio_path)
+                    if os.path.exists(rel_p):
+                        audio_path = rel_p
+
                 if os.path.exists(audio_path):
                     track = Track(os.path.basename(audio_path), audio_path, 'vocal')
                     track.load(self.processor)
-                    if 'f0' in data:
+
+                    if 'f0' in data and track.f0_edited is not None:
                         saved_f0 = np.array(data['f0'])
-                        if track.f0_edited is not None:
-                            min_len = min(len(saved_f0), len(track.f0_edited))
-                            track.f0_edited[:min_len] = saved_f0[:min_len]
-                            for state in track.segment_states:
-                                state['dirty'] = True
+                        min_len = min(len(saved_f0), len(track.f0_edited))
+                        track.f0_edited[:min_len] = saved_f0[:min_len]
+                        for state in track.segment_states:
+                            state['dirty'] = True
 
                     if 'tension' in data and getattr(track, 'tension_edited', None) is not None:
                         saved_tension = np.array(data['tension'], dtype=np.float32)
@@ -1358,25 +1869,75 @@ class HifiShifterGUI(QMainWindow):
                         track._tension_processed_audio = None
                         track._tension_processed_key = None
 
-                    
                     if 'params' in data and 'shift' in data['params']:
                         track.shift_value = data['params']['shift']
-                        
-                    self.tracks.append(track)
+
+                    tracks.append(track)
+
+            return {
+                'data': data,
+                'loaded_model_path': loaded_model_path,
+                'params': params,
+                'tracks': tracks,
+                'missing_audio': missing_audio,
+            }
+
+        def _ok(result: dict):
+            loaded_model_path = result.get('loaded_model_path')
+            if loaded_model_path:
+                self.model_path = loaded_model_path
+            else:
+                # Keep previous model_path (if any), but warn user if project had a model path
+                data = result.get('data', {})
+                mp = (data.get('model_path') if isinstance(data, dict) else None)
+                if mp:
+                    QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.model_not_found") + f": {mp}")
+
+            params = result.get('params', {}) or {}
+            if 'bpm' in params:
+                self.bpm_spin.setValue(params['bpm'])
+            if 'beats' in params:
+                self.beats_spin.setValue(params['beats'])
+
+            self.tracks = result.get('tracks', []) or []
 
             # Update Timeline
-            if self.processor.config:
-                self.timeline_panel.hop_size = self.processor.config['hop_size']
+            try:
+                if self.processor.config:
+                    self.timeline_panel.hop_size = self.processor.config['hop_size']
+            except Exception:
+                pass
             self.timeline_panel.refresh_tracks(self.tracks)
+
+            # Auto-select first track
+            if self.tracks:
+                self.timeline_panel.select_track(0)
+                self.on_track_selected(0)
 
             self.project_path = file_path
             self.status_label.setText(i18n.get("status.project_loaded") + f": {file_path}")
             self.setWindowTitle(f"HifiShifter - {os.path.basename(file_path)}")
-            
-        except Exception as e:
-            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.open_project_failed") + f": {str(e)}")
-            import traceback
-            traceback.print_exc()
+
+            missing = result.get('missing_audio', []) or []
+            if missing:
+                # Show a short list to avoid extremely large dialogs
+                preview = "\n".join(missing[:8])
+                if len(missing) > 8:
+                    preview += f"\n... (+{len(missing) - 8})"
+                QMessageBox.warning(self, i18n.get("msg.warning"), i18n.get("msg.audio_not_found") + ":\n" + preview)
+
+        def _fail(err_text: str):
+            QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.open_project_failed") + f":\n{err_text}")
+
+        self._start_bg_task(
+            kind='open_project',
+            status_text=i18n.get("status.loading_project"),
+            fn=_work,
+            total=None,
+            on_success=_ok,
+            on_failed=_fail,
+        )
+
 
     def save_project(self):
         if self.project_path:
@@ -2171,21 +2732,37 @@ class HifiShifterGUI(QMainWindow):
     def play_original(self):
         track = self.current_track
         if track and track.audio is not None:
+            # Avoid fighting with the real-time stream
+            try:
+                if self.is_playing:
+                    self.stop_playback(reset=False)
+            except Exception:
+                pass
+
             sd.stop()
             sd.play(track.audio, track.sr)
 
+
     def synthesize_and_play(self):
-        self.synthesize_audio_only()
-        if self.synthesized_audio is not None:
-            self.stop_playback(reset=True)
-            self.start_playback()
+        # Start playback pipeline: synthesize (if needed) -> mix -> play
+        self.stop_playback(reset=True)
+        self.start_playback()
+
 
     def delete_track(self, index):
         if 0 <= index < len(self.tracks):
+            # Deleting tracks while playing can lead to confusing audio state.
+            try:
+                if self.is_playing:
+                    self.stop_playback(reset=True)
+            except Exception:
+                pass
+
             reply = QMessageBox.question(self, i18n.get("track.delete_confirm_title"), 
                                          i18n.get("track.delete_confirm_msg").format(self.tracks[index].name),
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
                                          QMessageBox.StandardButton.No)
+
             if reply == QMessageBox.StandardButton.Yes:
                 del self.tracks[index]
                 if self.current_track_idx == index:

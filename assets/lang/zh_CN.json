@@ -36,7 +36,10 @@
 
 
     "status.ready": "就绪",
+    "status.loading_project": "正在加载工程...",
+    "status.mixing": "正在混音...",
     "status.tool.draw": "工具: 绘制 (左键绘制音高, 右键擦除)",
+
     "status.tool.edit": "工具: 编辑 (左键编辑{0}, 右键擦除)",
     "status.tool.select": "工具: 选区 (左键框选, 拖动选区上下移动)",
     "status.tool.move": "工具: 移动 (左键拖动音轨)",

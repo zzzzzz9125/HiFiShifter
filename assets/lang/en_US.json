@@ -36,7 +36,10 @@
 
 
     "status.ready": "Ready",
+    "status.loading_project": "Loading project...",
+    "status.mixing": "Mixing...",
     "status.tool.draw": "Tool: Draw (L-Click to draw, R-Click to erase)",
+
     "status.tool.edit": "Tool: Edit (L-Click to edit {0}, R-Click to erase)",
     "status.tool.select": "Tool: Select (L-Drag to box-select, drag selection vertically to move)",
     "status.tool.move": "Tool: Move (L-Click to drag track)",

@@ -11,7 +11,9 @@ HifiShifter is a GUI-based vocal editing and synthesis tool built on neural voco
 - **Long-audio incremental synthesis**: Automatically segments long audio and only re-synthesizes dirty segments for responsive editing.
 - **Project management**: Save/load projects (`.hsp`) including paths and edit data.
 - **Playback & export**: Play original/synth audio and export WAV (mixed or separated depending on GUI entry).
+- **Real-time playback mixing**: Volume faders, mute, and solo changes take effect during playback (no restart needed).
 - **i18n & theme**: Chinese/English UI plus Dark/Light themes.
+
 
 ## Installation
 
@@ -105,7 +107,8 @@ Audio processing has been refactored from a monolithic module into an orchestrat
 
 ## Known Issues
 
-There are still known issues, e.g. volume changes during playback may not apply, and importing long audio can freeze in some environments.
+There are still known issues, e.g. importing long audio can freeze in some environments, and multi-track / high sample rate content can consume significant resources.
+
 
 ## Documentation
 

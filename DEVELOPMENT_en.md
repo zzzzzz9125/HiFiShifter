@@ -71,6 +71,17 @@ HiFiShifter/
 - Edit Mode vs Select Mode interactions
 - Parameter switching (Pitch/Tension) with UI synchronization
 
+#### Real-time playback (streamed mixing; fader/mute/solo apply during playback)
+
+To make volume faders, mute, and solo changes take effect while playing, the playback path was changed from “offline mix once + `sd.play()`” to **callback-based mixing via `sounddevice.OutputStream`**.
+
+Key points:
+- **No Qt calls in the audio callback**: the callback runs on the sounddevice audio thread and only reads track states (`volume`/`muted`/`solo`) to generate each output block.
+- **Minimal shared state**: `self._playback_lock` protects a small shared state like `_playback_sample_pos`; the GUI timer reads sample position to drive the play cursor.
+- **Solo priority**: if any track is soloed, only solo tracks are mixed; otherwise all non-muted tracks are mixed.
+- **Latency**: changes apply on the next audio block (typically tens of milliseconds, device/buffer dependent).
+
+
 #### Parameter editing system (core abstraction introduced today)
 
 - Active parameter: `edit_param` (currently `pitch` / `tension`)
@@ -155,6 +166,7 @@ Additionally, `MainWindow` updates:
 
 ## 6. Known Issues
 
-- Real-time volume changes during playback may be delayed or not applied
+- Fader/mute/solo changes during playback apply on the next audio block (small latency may be noticeable)
 - Very long audio imports can freeze due to initial feature extraction
 - Multi-track / high sample rate content increases memory usage significantly
+
