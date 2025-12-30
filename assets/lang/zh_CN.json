@@ -68,7 +68,10 @@
     "status.synthesizing": "正在合成...",
     "status.synthesis_complete": "合成完成",
     "status.auto_synthesis_failed": "自动合成失败",
+    "status.pitch_modified_unsynth": "音高已修改 (未合成)",
+    "status.tension_modified_live": "张力已修改 (导出/播放时生效)",
     "status.paused": "暂停",
+
     "status.stopped": "停止",
     "track.delete": "删除音轨",
     "track.copy_pitch": "复制音高曲线",
@@ -80,6 +83,9 @@
     "dialog.select_audio": "选择音频文件",
     "dialog.export_audio": "导出音频",
     "dialog.export_mixed": "导出混合音频",
+    "dialog.unsaved_changes_title": "未保存的更改",
+    "dialog.unsaved_changes_text": "工程“{0}”有未保存的更改，是否保存？",
+
     "dialog.select_export_dir": "选择导出目录",
     "filter.audio_files": "音频文件 (*.wav *.flac *.mp3)",
     "msg.error": "错误",
@@ -100,9 +106,14 @@
     "msg.open_project_failed": "打开工程失败",
     "msg.save_project_failed": "保存工程失败",
     "msg.model_not_found": "找不到模型路径",
+    "project.untitled": "未命名工程",
+
     "btn.export_mixed": "导出混合音频",
     "btn.export_separated": "导出分轨音频",
+    "btn.save": "保存",
+    "btn.dont_save": "不保存",
     "btn.cancel": "取消",
+
     "menu.edit.paste_vocalshifter": "粘贴 VocalShifter 剪贴板数据",
     "msg.no_vocal_track_selected": "请先选中一个音频轨",
     "msg.no_pitch_data": "当前音频轨没有音高数据",

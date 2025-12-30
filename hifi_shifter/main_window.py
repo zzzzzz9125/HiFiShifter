@@ -95,8 +95,12 @@ class HifiShifterGUI(QMainWindow):
         self.project_path = None
         self.model_path = None
         
+        # Project dirty flag (unsaved changes)
+        self.is_dirty = False
+
         # Track Management
         self.tracks = []
+
         self.current_track_idx = -1
         
         # Tools
@@ -1476,8 +1480,17 @@ class HifiShifterGUI(QMainWindow):
 
         self.update_plot()
 
+    def on_track_mix_settings_changed(self, *_args):
+        """Mark project as dirty when track-level mix/arrangement settings change.
+
+        This covers volume/mute/solo/position changes which are saved into the project file.
+        """
+        self._set_dirty(True)
+
+
 
     def on_timeline_cursor_moved(self, x_frame):
+
         # Update playback position
         if self.processor.config:
             hop_size = self.processor.config['hop_size']
@@ -1915,8 +1928,10 @@ class HifiShifterGUI(QMainWindow):
                 self.on_track_selected(0)
 
             self.project_path = file_path
+            self._set_dirty(False)
             self.status_label.setText(i18n.get("status.project_loaded") + f": {file_path}")
-            self.setWindowTitle(f"HifiShifter - {os.path.basename(file_path)}")
+
+
 
             missing = result.get('missing_audio', []) or []
             if missing:
@@ -1939,20 +1954,21 @@ class HifiShifterGUI(QMainWindow):
         )
 
 
-    def save_project(self):
+    def save_project(self) -> bool:
         if self.project_path:
-            self._save_project_file(self.project_path)
-        else:
-            self.save_project_as()
+            return self._save_project_file(self.project_path)
+        return self.save_project_as()
 
-    def save_project_as(self):
+    def save_project_as(self) -> bool:
         file_path, _ = QFileDialog.getSaveFileName(self, i18n.get("menu.file.save_as"), "project.hsp", "HifiShifter Project (*.hsp *.json)")
-        if file_path:
-            self._save_project_file(file_path)
+        if not file_path:
+            return False
+        return self._save_project_file(file_path)
 
-    def _save_project_file(self, file_path):
+    def _save_project_file(self, file_path) -> bool:
         try:
             project_dir = os.path.dirname(os.path.abspath(file_path))
+
             
             tracks_data = []
             for track in self.tracks:
@@ -2001,13 +2017,61 @@ class HifiShifterGUI(QMainWindow):
                 json.dump(data, f, indent=4)
             
             self.project_path = file_path
+            self._set_dirty(False)
             self.status_label.setText(i18n.get("status.project_saved") + f": {file_path}")
-            self.setWindowTitle(f"HifiShifter - {os.path.basename(file_path)}")
-            
+            return True
+
+
         except Exception as e:
             QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.save_project_failed") + f": {str(e)}")
+            return False
+
+    def closeEvent(self, event):
+        """Prompt to save when closing a modified (dirty) project."""
+        accept_close = True
+
+        if getattr(self, 'is_dirty', False):
+            proj_name = os.path.basename(self.project_path) if self.project_path else i18n.get("project.untitled")
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle(i18n.get("dialog.unsaved_changes_title"))
+            msg.setText(i18n.get("dialog.unsaved_changes_text").format(proj_name))
+
+            btn_save = msg.addButton(i18n.get("btn.save"), QMessageBox.ButtonRole.AcceptRole)
+            btn_discard = msg.addButton(i18n.get("btn.dont_save"), QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = msg.addButton(i18n.get("btn.cancel"), QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(btn_save)
+
+            msg.exec()
+            clicked = msg.clickedButton()
+
+            if clicked == btn_cancel:
+                accept_close = False
+            elif clicked == btn_save:
+                # Save-as may be cancelled or save failed.
+                accept_close = bool(self.save_project())
+            else:
+                # btn_discard
+                accept_close = True
+
+        if not accept_close:
+            event.ignore()
+            return
+
+        # Stop playback/streams on exit
+        try:
+            if getattr(self, 'is_playing', False):
+                self.stop_playback(reset=False)
+        except Exception:
+            pass
+
+        event.accept()
+
+
 
     def get_pitch_y_bounds(self):
+
         """Pitch axis range used by the editor and by overlay params."""
         return float(getattr(self, 'pitch_y_min', 36)), float(getattr(self, 'pitch_y_max', 108))
 
@@ -2400,14 +2464,18 @@ class HifiShifterGUI(QMainWindow):
                                 if not (max_x < seg_start or min_x >= seg_end):
                                     track.segment_states[i]['dirty'] = True
 
-                        self.is_dirty = True
-                        self.status_label.setText("音高已修改 (未合成)")
+                        self._set_dirty(True)
+                        self.status_label.setText(i18n.get("status.pitch_modified_unsynth"))
+
+
                     else:
                         track.tension_version += 1
                         track._tension_processed_audio = None
                         track._tension_processed_key = None
-                        self.is_dirty = True
-                        self.status_label.setText("张力已修改 (导出/播放时生效)")
+                        self._set_dirty(True)
+                        self.status_label.setText(i18n.get("status.tension_modified_live"))
+
+
 
                 self.drag_start_f0 = None
                 self.drag_param = None
@@ -2641,8 +2709,10 @@ class HifiShifterGUI(QMainWindow):
                     track.tension_version += 1
                     track._tension_processed_audio = None
                     track._tension_processed_key = None
-                    self.is_dirty = True
-                    self.status_label.setText("张力已修改 (导出/播放时生效)")
+                    self._set_dirty(True)
+                    self.status_label.setText(i18n.get("status.tension_modified_live"))
+
+
 
             return
 
@@ -2702,8 +2772,10 @@ class HifiShifterGUI(QMainWindow):
             self.update_plot()
 
             if changed:
-                self.is_dirty = True
-                self.status_label.setText("音高已修改 (未合成)")
+                self._set_dirty(True)
+                self.status_label.setText(i18n.get("status.pitch_modified_unsynth"))
+
+
 
     
     def mouseReleaseEvent(self, ev):

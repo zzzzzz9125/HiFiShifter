@@ -68,7 +68,10 @@
     "status.synthesizing": "Synthesizing...",
     "status.synthesis_complete": "Synthesis complete",
     "status.auto_synthesis_failed": "Auto-synthesis failed",
+    "status.pitch_modified_unsynth": "Pitch modified (not synthesized)",
+    "status.tension_modified_live": "Tension modified (applies on export/playback)",
     "status.paused": "Paused",
+
     "status.stopped": "Stopped",
     "track.delete": "Delete Track",
     "track.copy_pitch": "Copy Pitch Curve",
@@ -80,6 +83,9 @@
     "dialog.select_audio": "Select Audio File",
     "dialog.export_audio": "Export Audio",
     "dialog.export_mixed": "Export Mixed Audio",
+    "dialog.unsaved_changes_title": "Unsaved Changes",
+    "dialog.unsaved_changes_text": "Project \"{0}\" has unsaved changes. Save before closing?",
+
     "dialog.select_export_dir": "Select Export Directory",
     "filter.audio_files": "Audio Files (*.wav *.flac *.mp3)",
     "msg.error": "Error",
@@ -100,9 +106,14 @@
     "msg.open_project_failed": "Failed to open project",
     "msg.save_project_failed": "Failed to save project",
     "msg.model_not_found": "Model path not found",
+    "project.untitled": "Untitled Project",
+
     "btn.export_mixed": "Export Mixed",
     "btn.export_separated": "Export Separated",
+    "btn.save": "Save",
+    "btn.dont_save": "Don't Save",
     "btn.cancel": "Cancel",
+
     "menu.edit.paste_vocalshifter": "Paste VocalShifter Data",
     "msg.no_vocal_track_selected": "Please select a vocal track first",
     "msg.no_pitch_data": "Current track has no pitch data",
