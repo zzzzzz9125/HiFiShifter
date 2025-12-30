@@ -151,6 +151,9 @@ class HifiShifterGUI(QMainWindow):
         self.init_ui()
         self.load_default_model()
         
+    def _set_dirty(self, dirty: bool = True):
+        self.is_dirty = dirty
+
     @property
     def current_track(self):
         if 0 <= self.current_track_idx < len(self.tracks):
