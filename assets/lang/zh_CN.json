@@ -27,11 +27,20 @@
     "label.bpm": "BPM",
     "label.time_sig": "拍号",
     "label.grid": "网格",
+    "label.edit_param": "编辑",
+    "param.pitch": "音高",
+    "param.tension": "张力",
     "label.pitch": "音高 (Note)",
+    "label.tension": "张力 (Tension)",
     "label.volume": "音量",
+
+
     "status.ready": "就绪",
     "status.tool.draw": "工具: 绘制 (左键绘制音高, 右键擦除)",
+    "status.tool.edit": "工具: 编辑 (左键编辑{0}, 右键擦除)",
+    "status.tool.select": "工具: 选区 (左键框选, 拖动选区上下移动)",
     "status.tool.move": "工具: 移动 (左键拖动音轨)",
+
     "status.default_model_loaded": "已加载默认模型",
     "status.default_model_failed": "加载默认模型失败",
     "status.loading_model": "正在加载模型",

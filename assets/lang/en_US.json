@@ -27,11 +27,20 @@
     "label.bpm": "BPM",
     "label.time_sig": "Time Sig",
     "label.grid": "Grid",
+    "label.edit_param": "Edit",
+    "param.pitch": "Pitch",
+    "param.tension": "Tension",
     "label.pitch": "Pitch (Note)",
+    "label.tension": "Tension",
     "label.volume": "Vol",
+
+
     "status.ready": "Ready",
     "status.tool.draw": "Tool: Draw (L-Click to draw, R-Click to erase)",
+    "status.tool.edit": "Tool: Edit (L-Click to edit {0}, R-Click to erase)",
+    "status.tool.select": "Tool: Select (L-Drag to box-select, drag selection vertically to move)",
     "status.tool.move": "Tool: Move (L-Click to drag track)",
+
     "status.default_model_loaded": "Default model loaded",
     "status.default_model_failed": "Failed to load default model",
     "status.loading_model": "Loading model",

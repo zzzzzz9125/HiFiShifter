@@ -20,7 +20,8 @@ from .widgets import CustomViewBox, PianoRollAxis, BPMAxis, MusicGridItem, Playb
 from .timeline import TimelinePanel, CONTROL_PANEL_WIDTH
 from .track import Track
 # Import AudioProcessor
-from .audio_processor import AudioProcessor
+from .audio_processor import AudioProcessor, apply_tension_tilt_pd
+
 # Import Config Manager
 from . import config_manager
 # Import Theme
@@ -256,8 +257,17 @@ class HifiShifterGUI(QMainWindow):
         self.mode_combo.setCurrentIndex(0)
         self.mode_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Prevent Spacebar toggle
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+
+        # Edit Parameter Selector (Pitch / Tension)
+        self.edit_param = 'pitch'  # 'pitch' | 'tension'
+        self.param_combo = QComboBox()
+        self.param_combo.addItems([i18n.get("param.pitch"), i18n.get("param.tension")])
+        self.param_combo.setCurrentIndex(0)
+        self.param_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.param_combo.currentIndexChanged.connect(self.on_param_changed)
         
         # Tab Shortcut for Mode Toggle
+
         self.tab_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Tab), self)
         self.tab_shortcut.activated.connect(self.toggle_mode)
 
@@ -287,8 +297,11 @@ class HifiShifterGUI(QMainWindow):
 
         controls_layout.addWidget(QLabel(i18n.get("label.mode") + ":"))
         controls_layout.addWidget(self.mode_combo)
+        controls_layout.addWidget(QLabel(i18n.get("label.edit_param") + ":"))
+        controls_layout.addWidget(self.param_combo)
         controls_layout.addWidget(QLabel(i18n.get("label.params") + ":"))
         controls_layout.addWidget(self.bpm_spin)
+
         controls_layout.addWidget(self.beats_spin)
         controls_layout.addWidget(QLabel(i18n.get("label.grid") + ":"))
         controls_layout.addWidget(self.grid_combo)
@@ -324,10 +337,40 @@ class HifiShifterGUI(QMainWindow):
         plot_container_layout.setContentsMargins(0, 0, 0, 0)
         plot_container_layout.setSpacing(0)
 
+        # Param switch inside the editor area (Pitch / Tension)
+        self.param_bar = QWidget(self.plot_container_widget)
+        param_bar_layout = QHBoxLayout(self.param_bar)
+        param_bar_layout.setContentsMargins(8, 6, 8, 6)
+        param_bar_layout.setSpacing(6)
+        param_bar_layout.addStretch()
+
+        self.param_button_group = QButtonGroup(self)
+        self.btn_param_pitch = QPushButton(i18n.get("param.pitch"))
+        self.btn_param_pitch.setCheckable(True)
+        self.btn_param_tension = QPushButton(i18n.get("param.tension"))
+        self.btn_param_tension.setCheckable(True)
+
+
+        for b in (self.btn_param_pitch, self.btn_param_tension):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setMinimumWidth(48)
+
+        self.param_button_group.setExclusive(True)
+        self.param_button_group.addButton(self.btn_param_pitch)
+        self.param_button_group.addButton(self.btn_param_tension)
+        self.btn_param_pitch.setChecked(True)
+        self.param_button_group.buttonClicked.connect(self.on_param_button_clicked)
+
+        param_bar_layout.addWidget(self.btn_param_pitch)
+        param_bar_layout.addWidget(self.btn_param_tension)
+        plot_container_layout.addWidget(self.param_bar)
+
         self.plot_widget = pg.PlotWidget(
+
             viewBox=CustomViewBox(self), 
             axisItems={
-                'left': PianoRollAxis(orientation='left'),
+                'left': PianoRollAxis(self, orientation='left'),
+
                 'top': BPMAxis(self, orientation='top'),
                 'bottom': pg.AxisItem(orientation='bottom') # Standard axis, will be hidden
             }
@@ -349,8 +392,9 @@ class HifiShifterGUI(QMainWindow):
         
         current_theme = theme.get_current_theme()
         self.plot_widget.setBackground(current_theme['graph']['background'])
-        self.plot_widget.setLabel('left', i18n.get("label.pitch"))
+        self.update_left_axis_label()
         # Disable default X grid, keep Y grid
+
         self.plot_widget.showGrid(x=False, y=True, alpha=current_theme['graph'].get('grid_alpha', 0.5))
         self.plot_widget.setMouseEnabled(x=True, y=True)
         
@@ -363,10 +407,12 @@ class HifiShifterGUI(QMainWindow):
         self.plot_widget.hideAxis('bottom')
         # self.plot_widget.getAxis('top').setLabel('小节-拍') # Removed label as requested
         
-        # Limit Y range: Start from C0 (MIDI 12)
-        # 12 octaves from C0 is plenty (12 + 144 = 156)
-        self.plot_widget.setLimits(yMin=12, yMax=156)
+        # Limit Y range: C2..C8 (MIDI 36..108)
+        self.pitch_y_min = 36
+        self.pitch_y_max = 108
+        self.plot_widget.setLimits(yMin=self.pitch_y_min, yMax=self.pitch_y_max)
         self.plot_widget.setYRange(60, 72, padding=0) # Initial view: C4 to C5
+
 
         # Scrollbar for Piano Roll
         self.plot_scrollbar = QScrollBar(Qt.Orientation.Vertical)
@@ -414,9 +460,16 @@ class HifiShifterGUI(QMainWindow):
         
         self.f0_orig_curve_item = self.plot_widget.plot(pen=pg.mkPen(color=(255, 255, 255, 80), width=2, style=Qt.PenStyle.DashLine), name="Original F0")
         self.f0_curve_item = self.plot_widget.plot(pen=pg.mkPen('#00ff00', width=3), name="F0")
-        self.f0_selected_curve_item = self.plot_widget.plot(pen=pg.mkPen('#0099ff', width=3), name="Selected F0")
+
+        # Selected/highlighted portion for current parameter (pitch/tension/...) 
+        self.selected_param_curve_item = self.plot_widget.plot(pen=pg.mkPen('#0099ff', width=4), name="Selected Param")
+        self.selected_param_curve_item.setZValue(900)
+
+        # Tension overlay (mapped to the same Y axis as pitch)
+        self.tension_curve_item = self.plot_widget.plot(pen=pg.mkPen('#cc66ff', width=2), name="Tension")
         
         # Selection Box
+
         self.selection_box_item = QGraphicsRectItem()
         # Use cosmetic pen to ensure visibility at any zoom level
         # Initial colors, will be updated by update_plot or theme change
@@ -430,11 +483,17 @@ class HifiShifterGUI(QMainWindow):
         
         # Selection State
         self.selection_mask = None
+        self.selection_param = None  # which param the current selection applies to
         self.is_selecting = False
         self.is_dragging_selection = False
         self.selection_start_pos = None
         self.drag_start_pos = None
-        self.drag_start_f0 = None
+        # Generic drag state (for pitch/tension and future params)
+        self.drag_param = None
+        self.drag_start_values = None
+        self.drag_start_f0 = None  # kept for backward compatibility
+
+
         
         # Update timeline bounds to ensure limits are applied to plot_widget
         self.timeline_panel.update_timeline_bounds()
@@ -497,9 +556,10 @@ class HifiShifterGUI(QMainWindow):
         min_y, max_y = range
         view_height = max_y - min_y
         
-        # Total range: 12 to 156
-        total_min = 12
-        total_max = 156
+        # Total range: C2..C8
+        total_min = getattr(self, 'pitch_y_min', 36)
+        total_max = getattr(self, 'pitch_y_max', 108)
+
         total_height = total_max - total_min
         
         # Scrollbar represents the "Top" of the view relative to total range
@@ -550,8 +610,9 @@ class HifiShifterGUI(QMainWindow):
         current_range = self.plot_widget.plotItem.vb.viewRange()[1]
         view_height = current_range[1] - current_range[0]
         
-        total_min = 12
-        total_max = 156
+        total_min = getattr(self, 'pitch_y_min', 36)
+        total_max = getattr(self, 'pitch_y_max', 108)
+
         total_height = total_max - total_min
         scrollable_height = total_height - view_height
         
@@ -565,10 +626,11 @@ class HifiShifterGUI(QMainWindow):
         self.tool_mode = mode
         if mode == 'draw':
             self.plot_widget.setCursor(Qt.CursorShape.CrossCursor)
-            self.status_label.setText(i18n.get("status.tool.draw"))
+            self.status_label.setText(i18n.get("status.tool.edit").format(self._current_param_display_name()))
         elif mode == 'move':
             self.plot_widget.setCursor(Qt.CursorShape.OpenHandCursor)
             self.status_label.setText(i18n.get("status.tool.move"))
+
 
     def toggle_mode(self):
         current = self.mode_combo.currentIndex()
@@ -592,60 +654,102 @@ class HifiShifterGUI(QMainWindow):
 
     def push_undo(self):
         track = self.current_track
-        if not track or track.track_type != 'vocal' or track.f0_edited is None:
+        if not track or track.track_type != 'vocal':
             return
-            
-        # Deep copy current state
-        track.undo_stack.append(track.f0_edited.copy())
-        # Limit stack size
-        if len(track.undo_stack) > 16:
-            track.undo_stack.pop(0)
-        # Clear redo stack on new action
-        track.redo_stack.clear()
+
+        if getattr(self, 'edit_param', 'pitch') == 'tension':
+            if getattr(track, 'tension_edited', None) is None:
+                return
+            track.tension_undo_stack.append(track.tension_edited.copy())
+            if len(track.tension_undo_stack) > 16:
+                track.tension_undo_stack.pop(0)
+            track.tension_redo_stack.clear()
+        else:
+            if track.f0_edited is None:
+                return
+            track.undo_stack.append(track.f0_edited.copy())
+            if len(track.undo_stack) > 16:
+                track.undo_stack.pop(0)
+            track.redo_stack.clear()
+
 
     def undo(self):
         track = self.current_track
         if not track or track.track_type != 'vocal':
             return
 
+        if getattr(self, 'edit_param', 'pitch') == 'tension':
+            if getattr(track, 'tension_edited', None) is None:
+                return
+            if not track.tension_undo_stack:
+                self.status_label.setText(i18n.get("status.no_undo"))
+                return
+
+            track.tension_redo_stack.append(track.tension_edited.copy())
+            track.tension_edited = track.tension_undo_stack.pop()
+            track.tension_version += 1
+            track._tension_processed_audio = None
+            track._tension_processed_key = None
+
+            self.update_plot()
+            self.status_label.setText(i18n.get("status.undo"))
+            return
+
+        # Pitch undo
+        if track.f0_edited is None:
+            return
         if not track.undo_stack:
             self.status_label.setText(i18n.get("status.no_undo"))
             return
-            
-        # Save current state to redo
+
         track.redo_stack.append(track.f0_edited.copy())
-        
-        # Restore from undo
         track.f0_edited = track.undo_stack.pop()
-        
-        # Mark dirty
+
         for state in track.segment_states:
             state['dirty'] = True
-            
+
         self.update_plot()
         self.status_label.setText(i18n.get("status.undo"))
+
 
     def redo(self):
         track = self.current_track
         if not track or track.track_type != 'vocal':
             return
 
+        if getattr(self, 'edit_param', 'pitch') == 'tension':
+            if getattr(track, 'tension_edited', None) is None:
+                return
+            if not track.tension_redo_stack:
+                self.status_label.setText(i18n.get("status.no_redo"))
+                return
+
+            track.tension_undo_stack.append(track.tension_edited.copy())
+            track.tension_edited = track.tension_redo_stack.pop()
+            track.tension_version += 1
+            track._tension_processed_audio = None
+            track._tension_processed_key = None
+
+            self.update_plot()
+            self.status_label.setText(i18n.get("status.redo"))
+            return
+
+        # Pitch redo
+        if track.f0_edited is None:
+            return
         if not track.redo_stack:
             self.status_label.setText(i18n.get("status.no_redo"))
             return
-            
-        # Save current state to undo
+
         track.undo_stack.append(track.f0_edited.copy())
-        
-        # Restore from redo
         track.f0_edited = track.redo_stack.pop()
-        
-        # Mark dirty
+
         for state in track.segment_states:
             state['dirty'] = True
-            
+
         self.update_plot()
         self.status_label.setText(i18n.get("status.redo"))
+
 
     def toggle_playback(self):
         if self.is_playing:
@@ -918,10 +1022,10 @@ class HifiShifterGUI(QMainWindow):
         # self.timeline_panel.select_track(index) # Avoid loop if triggered by timeline
         
         # Clear selection when switching tracks
-        self.selection_mask = None
-        self.selection_box_item.setVisible(False)
-        
+        self.clear_selection(hide_box=True)
+
         self.update_plot()
+
 
     def on_timeline_cursor_moved(self, x_frame):
         # Update playback position
@@ -965,40 +1069,81 @@ class HifiShifterGUI(QMainWindow):
 
             self.status_label.setText(i18n.get("status.audio_load_failed"))
 
+    def _get_track_audio_for_mix(self, track: Track):
+        """Return audio buffer for mixing/export, applying tension post-FX for vocal tracks."""
+        if track is None or track.synthesized_audio is None:
+            return None
+
+        audio = track.synthesized_audio
+
+        if track.track_type != 'vocal':
+            return audio
+
+        tension = getattr(track, 'tension_edited', None)
+        f0 = getattr(track, 'f0_edited', None)
+        if tension is None or f0 is None:
+            return audio
+
+        # Skip if neutral
+        try:
+            if np.nanmax(np.abs(tension)) < 1e-6:
+                return audio
+        except Exception:
+            return audio
+
+        sr = self.processor.config['audio_sample_rate'] if self.processor.config else 44100
+        hop_size = self.processor.config['hop_size'] if self.processor.config else 512
+
+        key = (getattr(track, 'synth_version', 0), getattr(track, 'tension_version', 0), int(len(audio)))
+        if getattr(track, '_tension_processed_key', None) == key and getattr(track, '_tension_processed_audio', None) is not None:
+            return track._tension_processed_audio
+
+        try:
+            processed = apply_tension_tilt_pd(audio, sr, f0, tension, hop_size)
+        except Exception as e:
+            # Fail-safe: don't break playback/export
+            print(f"Tension post-FX failed: {e}")
+            processed = audio
+
+        track._tension_processed_audio = processed
+        track._tension_processed_key = key
+        return processed
+
     def mix_tracks(self):
         max_len = 0
         active_tracks = [t for t in self.tracks if not t.muted]
         solo_tracks = [t for t in self.tracks if t.solo]
         if solo_tracks:
             active_tracks = solo_tracks
-        
+
         if not active_tracks:
             return None
 
+        hop_size = self.processor.config['hop_size'] if self.processor.config else 512
+
         for track in active_tracks:
-            if track.synthesized_audio is not None:
-                # Calculate length in samples including offset
-                hop_size = self.processor.config['hop_size'] if self.processor.config else 512
+            audio = self._get_track_audio_for_mix(track)
+            if audio is not None:
                 start_sample = track.start_frame * hop_size
-                end_sample = start_sample + len(track.synthesized_audio)
+                end_sample = start_sample + len(audio)
                 max_len = max(max_len, end_sample)
-        
+
         if max_len == 0:
             return None
-            
+
         mixed_audio = np.zeros(max_len, dtype=np.float32)
-        
+
         for track in active_tracks:
-            if track.synthesized_audio is not None:
-                audio = track.synthesized_audio
-                hop_size = self.processor.config['hop_size'] if self.processor.config else 512
-                start_sample = track.start_frame * hop_size
-                
-                # Ensure we don't go out of bounds (shouldn't happen with max_len logic)
-                l = len(audio)
-                mixed_audio[start_sample:start_sample+l] += audio * track.volume
-                
+            audio = self._get_track_audio_for_mix(track)
+            if audio is None:
+                continue
+
+            start_sample = track.start_frame * hop_size
+            l = len(audio)
+            mixed_audio[start_sample:start_sample + l] += audio * track.volume
+
         return mixed_audio
+
 
     def export_audio_dialog(self):
         # Ensure everything is synthesized
@@ -1055,9 +1200,12 @@ class HifiShifterGUI(QMainWindow):
                 
                 file_path = os.path.join(dir_path, f"{safe_name}.wav")
                 
-                audio = track.synthesized_audio
+                audio = self._get_track_audio_for_mix(track)
+                if audio is None:
+                    continue
                 if audio.dtype != np.float32:
                     audio = audio.astype(np.float32)
+
                 
                 # Handle start_frame offset
                 start_sample = track.start_frame * hop_size
@@ -1169,6 +1317,15 @@ class HifiShifterGUI(QMainWindow):
                             # Mark dirty
                             for state in track.segment_states:
                                 state['dirty'] = True
+
+                        if 'tension' in t_data and getattr(track, 'tension_edited', None) is not None:
+                            saved_tension = np.array(t_data['tension'], dtype=np.float32)
+                            min_len = min(len(saved_tension), len(track.tension_edited))
+                            track.tension_edited[:min_len] = saved_tension[:min_len]
+                            track.tension_version += 1
+                            track._tension_processed_audio = None
+                            track._tension_processed_key = None
+
                         
                         self.tracks.append(track)
                     else:
@@ -1187,8 +1344,20 @@ class HifiShifterGUI(QMainWindow):
                     track.load(self.processor)
                     if 'f0' in data:
                         saved_f0 = np.array(data['f0'])
-                        if len(saved_f0) == len(track.f0_edited):
-                            track.f0_edited = saved_f0
+                        if track.f0_edited is not None:
+                            min_len = min(len(saved_f0), len(track.f0_edited))
+                            track.f0_edited[:min_len] = saved_f0[:min_len]
+                            for state in track.segment_states:
+                                state['dirty'] = True
+
+                    if 'tension' in data and getattr(track, 'tension_edited', None) is not None:
+                        saved_tension = np.array(data['tension'], dtype=np.float32)
+                        min_len = min(len(saved_tension), len(track.tension_edited))
+                        track.tension_edited[:min_len] = saved_tension[:min_len]
+                        track.tension_version += 1
+                        track._tension_processed_audio = None
+                        track._tension_processed_key = None
+
                     
                     if 'params' in data and 'shift' in data['params']:
                         track.shift_value = data['params']['shift']
@@ -1244,7 +1413,10 @@ class HifiShifterGUI(QMainWindow):
                 }
                 if track.track_type == 'vocal' and track.f0_edited is not None:
                     t_data['f0'] = track.f0_edited.tolist()
+                if track.track_type == 'vocal' and getattr(track, 'tension_edited', None) is not None:
+                    t_data['tension'] = track.tension_edited.tolist()
                 tracks_data.append(t_data)
+
 
             # Model path relative
             model_path_save = self.model_path
@@ -1274,7 +1446,178 @@ class HifiShifterGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, i18n.get("msg.error"), i18n.get("msg.save_project_failed") + f": {str(e)}")
 
+    def get_pitch_y_bounds(self):
+        """Pitch axis range used by the editor and by overlay params."""
+        return float(getattr(self, 'pitch_y_min', 36)), float(getattr(self, 'pitch_y_max', 108))
+
+    def tension_to_plot_y(self, tension_values: np.ndarray) -> np.ndarray:
+        """Map tension [-100,100] onto the pitch Y axis for overlay display."""
+        y_min, y_max = self.get_pitch_y_bounds()
+        t = np.asarray(tension_values, dtype=np.float32)
+        t = np.clip(t, -100.0, 100.0)
+        return y_min + ((t + 100.0) / 200.0) * (y_max - y_min)
+
+    def plot_y_to_tension(self, y: float) -> float:
+        y_min, y_max = self.get_pitch_y_bounds()
+        t = ((float(y) - y_min) / (y_max - y_min)) * 200.0 - 100.0
+        return float(np.clip(t, -100.0, 100.0))
+
+    def tension_value_to_plot_y(self, t: float) -> float:
+        """Map a single tension value [-100,100] to plot Y."""
+        y_min, y_max = self.get_pitch_y_bounds()
+        t = float(np.clip(float(t), -100.0, 100.0))
+        return float(y_min + ((t + 100.0) / 200.0) * (y_max - y_min))
+
+    # ---- Axis label abstraction (so left axis follows current param) ----
+    def get_axis_param(self) -> str:
+        """Which param the left axis should represent (defaults to current edit param)."""
+        return getattr(self, 'edit_param', 'pitch')
+
+    def get_param_axis_label(self, param: str | None = None) -> str:
+        """Left-axis label text for a given param."""
+        param = param or self.get_axis_param()
+        if param == 'pitch':
+            return i18n.get("label.pitch")
+        if param == 'tension':
+            # Added in lang files; keep a safe fallback.
+            try:
+                return i18n.get("label.tension")
+            except Exception:
+                return "张力 (Tension)"
+        return str(param)
+
+    def update_left_axis_label(self):
+        """Update vertical left-axis label to follow current parameter panel."""
+        try:
+            if hasattr(self, 'plot_widget') and self.plot_widget is not None:
+                self.plot_widget.setLabel('left', self.get_param_axis_label())
+        except Exception:
+            pass
+
+
+    def get_param_axis_kind(self, param: str | None = None) -> str:
+        """Return axis kind for a param.
+
+        - 'note': render note names (pitch)
+        - 'linear': render numeric values mapped from plot Y
+        """
+        param = param or self.get_axis_param()
+        if param == 'pitch':
+            return 'note'
+        # tension / future params default to numeric axis
+        return 'linear'
+
+    def plot_y_to_param_value(self, y: float, param: str | None = None) -> float:
+        """Convert plot Y coordinate -> param value for axis labeling."""
+        param = param or self.get_axis_param()
+        if param == 'tension':
+            return self.plot_y_to_tension(y)
+        # pitch (and default): identity in MIDI space
+        return float(y)
+
+    def param_value_to_plot_y(self, value: float, param: str | None = None) -> float:
+        """Convert param value -> plot Y coordinate (inverse of plot_y_to_param_value)."""
+        param = param or self.get_axis_param()
+        if param == 'tension':
+            return self.tension_value_to_plot_y(value)
+        return float(value)
+
+    def format_param_axis_value(self, value: float, param: str | None = None) -> str:
+        """Format numeric axis labels for a param."""
+        param = param or self.get_axis_param()
+        # tension is integer-like [-100..100]
+        if param == 'tension':
+            return f"{float(value):.0f}"
+        # default numeric
+        return f"{float(value):.0f}"
+
+    # ---- Param abstraction (for future: volume/formant/etc.) ----
+
+    def get_param_array(self, track: Track, param: str | None = None):
+        param = param or getattr(self, 'edit_param', 'pitch')
+        if param == 'tension':
+            return getattr(track, 'tension_edited', None)
+        return getattr(track, 'f0_edited', None)
+
+    def get_param_curve_y(self, track: Track, param: str | None = None):
+        param = param or getattr(self, 'edit_param', 'pitch')
+        arr = self.get_param_array(track, param)
+        if arr is None:
+            return None
+        if param == 'tension':
+            return self.tension_to_plot_y(arr)
+        return arr
+
+    def apply_param_drag_delta(self, base_values: np.ndarray, dy: float, param: str):
+        """Apply drag delta in plot Y units onto parameter values."""
+        if param == 'tension':
+            y_min, y_max = self.get_pitch_y_bounds()
+            units_per_y = 200.0 / max(1e-6, (y_max - y_min))
+            delta = float(dy) * units_per_y
+            out = base_values + delta
+            return np.clip(out, -100.0, 100.0)
+        # pitch: 1 plot unit == 1 MIDI
+        return base_values + float(dy)
+
+    # ---- Selection abstraction / highlight (works for all params) ----
+    def clear_selection(self, *, hide_box: bool = True):
+        """Clear selection state and remove highlight overlay."""
+        self.selection_mask = None
+        self.selection_param = None
+        self.is_selecting = False
+        self.is_dragging_selection = False
+        self.drag_param = None
+        self.drag_start_values = None
+        if hide_box and hasattr(self, 'selection_box_item'):
+            self.selection_box_item.setVisible(False)
+        if hasattr(self, 'selected_param_curve_item'):
+            self.selected_param_curve_item.clear()
+
+    def set_selection(self, mask: np.ndarray | None, *, param: str | None = None):
+        """Set selection mask for a given param and refresh highlight."""
+        self.selection_mask = mask
+        self.selection_param = (param or getattr(self, 'edit_param', 'pitch')) if mask is not None else None
+        self.update_selection_highlight()
+
+    def update_selection_highlight(self):
+        """Render the selected portion of the selected param as an overlay curve."""
+        if not hasattr(self, 'selected_param_curve_item'):
+            return
+
+        track = getattr(self, 'current_track', None)
+        if not track or track.track_type != 'vocal':
+            self.selected_param_curve_item.clear()
+            return
+
+        if self.selection_mask is None or self.selection_param is None:
+            self.selected_param_curve_item.clear()
+            return
+
+        curve_y = self.get_param_curve_y(track, self.selection_param)
+        if curve_y is None:
+            self.selected_param_curve_item.clear()
+            return
+
+        if len(self.selection_mask) != len(curve_y):
+            self.selected_param_curve_item.clear()
+            return
+
+        x = np.arange(len(curve_y)) + track.start_frame
+        y = np.array(curve_y, copy=True)
+        y[~self.selection_mask] = np.nan
+        self.selected_param_curve_item.setData(x, y, connect="finite")
+
+        # Theme-aware pen
+        current_theme = theme.get_current_theme()
+        sel_color = current_theme['graph'].get('f0_selected_pen', '#0099ff')
+        c_sel = pg.mkColor(sel_color)
+        c_sel.setAlpha(240)
+        self.selected_param_curve_item.setPen(pg.mkPen(color=c_sel, width=4))
+
+
     def update_plot(self):
+
+
         track = self.current_track
         
         # Update Selection Box Theme
@@ -1291,7 +1634,11 @@ class HifiShifterGUI(QMainWindow):
             self.waveform_curve.clear()
             self.f0_orig_curve_item.clear()
             self.f0_curve_item.clear()
+            self.selected_param_curve_item.clear()
+            self.tension_curve_item.clear()
             return
+
+
 
         # Waveform
         if track.audio is not None:
@@ -1322,48 +1669,127 @@ class HifiShifterGUI(QMainWindow):
             current_theme = theme.get_current_theme()
             f0_orig_pen = current_theme['graph'].get('f0_orig_pen', (255, 255, 255, 80))
             f0_pen = current_theme['graph'].get('f0_pen', '#00ff00')
-            f0_selected_pen = current_theme['graph'].get('f0_selected_pen', '#0099ff')
+
             
+            pitch_alpha = 90 if getattr(self, 'edit_param', 'pitch') == 'tension' else 255
+
             if track.f0_original is not None:
                 self.f0_orig_curve_item.setData(x_f0, track.f0_original, connect="finite")
-                self.f0_orig_curve_item.setPen(pg.mkPen(color=f0_orig_pen, width=2, style=Qt.PenStyle.DashLine))
+                c_orig = pg.mkColor(f0_orig_pen)
+                c_orig.setAlpha(pitch_alpha)
+                self.f0_orig_curve_item.setPen(pg.mkPen(color=c_orig, width=2, style=Qt.PenStyle.DashLine))
             else:
                 self.f0_orig_curve_item.clear()
 
+
             if track.f0_edited is not None:
                 self.f0_curve_item.setData(x_f0, track.f0_edited, connect="finite")
-                self.f0_curve_item.setPen(pg.mkPen(color=f0_pen, width=3))
+                c = pg.mkColor(f0_pen)
+                c.setAlpha(pitch_alpha)
+                self.f0_curve_item.setPen(pg.mkPen(color=c, width=3))
                 
-                # Update Selection Curve
-                if self.selection_mask is not None and len(self.selection_mask) == len(track.f0_edited):
-                    # Create a masked array for display
-                    selected_f0 = track.f0_edited.copy()
-                    selected_f0[~self.selection_mask] = np.nan
-                    self.f0_selected_curve_item.setData(x_f0, selected_f0, connect="finite")
-                    self.f0_selected_curve_item.setPen(pg.mkPen(color=f0_selected_pen, width=3))
-                else:
-                    self.f0_selected_curve_item.clear()
+                # Selection highlight (works for pitch/tension/...) 
+                self.update_selection_highlight()
+
+
+
             else:
                 self.f0_curve_item.clear()
-                self.f0_selected_curve_item.clear()
+                self.selected_param_curve_item.clear()
+
+
+            # Tension overlay: only visible while editing tension
+            if getattr(self, 'edit_param', 'pitch') == 'tension' and getattr(track, 'tension_edited', None) is not None:
+                x_t = np.arange(len(track.tension_edited)) + track.start_frame
+                y_t = self.tension_to_plot_y(track.tension_edited)
+                self.tension_curve_item.setData(x_t, y_t, connect="finite")
+            else:
+                self.tension_curve_item.clear()
+
         else:
             self.f0_orig_curve_item.clear()
             self.f0_curve_item.clear()
-            self.f0_selected_curve_item.clear()
+            self.selected_param_curve_item.clear()
+            self.tension_curve_item.clear()
+
+
+
+    def _current_param_display_name(self):
+        return i18n.get("param.pitch") if getattr(self, 'edit_param', 'pitch') == 'pitch' else i18n.get("param.tension")
+
+    def set_edit_param(self, param: str):
+        """Set current editable parameter ('pitch' | 'tension') and sync UI."""
+        param = 'tension' if param == 'tension' else 'pitch'
+        if getattr(self, 'edit_param', 'pitch') == param:
+            return
+
+        self.edit_param = param
+        self.update_left_axis_label()
+
+
+        # Switching parameter invalidates current selection
+        self.clear_selection(hide_box=True)
+
+
+        # Avoid mixing stroke interpolation across parameters
+        self.last_mouse_pos = None
+
+
+        # Sync top combo
+        if hasattr(self, 'param_combo') and self.param_combo is not None:
+            idx = 0 if param == 'pitch' else 1
+            if self.param_combo.currentIndex() != idx:
+                self.param_combo.blockSignals(True)
+                self.param_combo.setCurrentIndex(idx)
+                self.param_combo.blockSignals(False)
+
+        # Sync editor buttons
+        if hasattr(self, 'btn_param_pitch') and hasattr(self, 'btn_param_tension'):
+            if param == 'pitch':
+                self.btn_param_pitch.setChecked(True)
+            else:
+                self.btn_param_tension.setChecked(True)
+
+        self.update_plot()
+
+        # Force left axis refresh (tickStrings depends on edit_param)
+        try:
+            axis_left = self.plot_widget.getAxis('left')
+            axis_left.picture = None
+            axis_left.update()
+        except Exception:
+            pass
+
+        if self.tool_mode == 'draw':
+            self.status_label.setText(i18n.get("status.tool.edit").format(self._current_param_display_name()))
+
+
+    def on_param_changed(self, index):
+        self.set_edit_param('pitch' if index == 0 else 'tension')
+
+    def on_param_button_clicked(self, button):
+        if button == getattr(self, 'btn_param_tension', None):
+            self.set_edit_param('tension')
+        else:
+            self.set_edit_param('pitch')
+
 
     def on_mode_changed(self, index):
+
         if index == 0:
             self.tool_mode = 'draw'
             self.plot_widget.setCursor(Qt.CursorShape.CrossCursor)
-            self.status_label.setText("工具: 绘制 (左键绘制音高, 右键擦除)")
+            self.status_label.setText(i18n.get("status.tool.edit").format(self._current_param_display_name()))
+
             # Clear selection
-            self.selection_mask = None
-            self.selection_box_item.setVisible(False)
+            self.clear_selection(hide_box=True)
             self.update_plot()
+
         elif index == 1:
             self.tool_mode = 'select'
             self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
-            self.status_label.setText("工具: 选区 (左键框选, 拖动选区上下移动)")
+            self.status_label.setText(i18n.get("status.tool.select"))
+
 
     def on_viewbox_mouse_release(self, ev):
         if self.tool_mode == 'move':
@@ -1375,41 +1801,57 @@ class HifiShifterGUI(QMainWindow):
                 self.is_selecting = False
                 self.selection_box_item.setVisible(False)
                 
-                # Calculate Selection Mask
+                # Calculate Selection Mask (for current parameter)
                 rect = self.selection_box_item.rect()
                 track = self.current_track
-                if track and track.track_type == 'vocal' and track.f0_edited is not None:
+                if track and track.track_type == 'vocal':
+                    arr = self.get_param_array(track)
+                    curve_y = self.get_param_curve_y(track)
+                    if arr is None or curve_y is None:
+                        return
+
                     x_min = rect.left() - track.start_frame
                     x_max = rect.right() - track.start_frame
                     y_min = rect.top()
                     y_max = rect.bottom()
-                    
-                    # Vectorized check
-                    indices = np.arange(len(track.f0_edited))
+
+                    indices = np.arange(len(arr))
                     x_mask = (indices >= x_min) & (indices <= x_max)
-                    y_mask = (track.f0_edited >= y_min) & (track.f0_edited <= y_max)
-                    
-                    self.selection_mask = x_mask & y_mask
+                    y_mask = (curve_y >= y_min) & (curve_y <= y_max)
+
+                    self.set_selection(x_mask & y_mask, param=getattr(self, 'edit_param', 'pitch'))
                     self.update_plot()
+
+
                     
             elif self.is_dragging_selection:
                 self.is_dragging_selection = False
                 self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
-                self.drag_start_f0 = None
-                
-                # Mark dirty segments
+
+                # Commit drag: pitch needs re-synthesis, tension is post-FX only
                 track = self.current_track
                 if track and self.selection_mask is not None:
-                    # Find affected range
-                    indices = np.where(self.selection_mask)[0]
-                    if len(indices) > 0:
-                        min_x, max_x = indices[0], indices[-1]
-                        for i, (seg_start, seg_end) in enumerate(track.segments):
-                            if not (max_x < seg_start or min_x >= seg_end):
-                                track.segment_states[i]['dirty'] = True
-                    
-                    self.is_dirty = True
-                    self.status_label.setText("音高已修改 (未合成)")
+                    if getattr(self, 'drag_param', getattr(self, 'edit_param', 'pitch')) == 'pitch':
+                        indices = np.where(self.selection_mask)[0]
+                        if len(indices) > 0:
+                            min_x, max_x = indices[0], indices[-1]
+                            for i, (seg_start, seg_end) in enumerate(track.segments):
+                                if not (max_x < seg_start or min_x >= seg_end):
+                                    track.segment_states[i]['dirty'] = True
+
+                        self.is_dirty = True
+                        self.status_label.setText("音高已修改 (未合成)")
+                    else:
+                        track.tension_version += 1
+                        track._tension_processed_audio = None
+                        track._tension_processed_key = None
+                        self.is_dirty = True
+                        self.status_label.setText("张力已修改 (导出/播放时生效)")
+
+                self.drag_start_f0 = None
+                self.drag_param = None
+                self.drag_start_values = None
+
 
         self.last_mouse_pos = None
 
@@ -1437,9 +1879,10 @@ class HifiShifterGUI(QMainWindow):
                 self.update_plot()
                 self.status_label.setText(f"移动音轨: {new_start} 帧")
                 
-        elif self.tool_mode == 'draw' and track.track_type == 'vocal' and track.f0_edited is not None:
+        elif self.tool_mode == 'draw' and track.track_type == 'vocal' and (track.f0_edited is not None or getattr(track, 'tension_edited', None) is not None):
             if is_left or is_right:
                 self.handle_draw(mouse_point, is_left, is_right)
+
                 
         elif self.tool_mode == 'select':
             if self.is_selecting:
@@ -1451,12 +1894,23 @@ class HifiShifterGUI(QMainWindow):
             elif self.is_dragging_selection:
                 # Drag Selection
                 dy = mouse_point.y() - self.drag_start_pos.y()
-                
-                # Apply delta to selected points
-                if self.selection_mask is not None:
-                    track.f0_edited = self.drag_start_f0.copy()
-                    track.f0_edited[self.selection_mask] += dy
+
+                if self.selection_mask is not None and self.drag_start_values is not None:
+                    param = self.drag_param or getattr(self, 'edit_param', 'pitch')
+                    base = self.drag_start_values.copy()
+                    base[self.selection_mask] = self.apply_param_drag_delta(base[self.selection_mask], dy, param)
+
+                    if param == 'tension':
+                        if getattr(track, 'tension_edited', None) is not None:
+                            track.tension_edited = base
+                            track._tension_processed_audio = None
+                            track._tension_processed_key = None
+                    else:
+                        if track.f0_edited is not None:
+                            track.f0_edited = base
+
                     self.update_plot()
+
 
     def on_scene_mouse_move(self, pos):
         """处理场景鼠标移动事件 (悬停/光标状态)"""
@@ -1472,11 +1926,19 @@ class HifiShifterGUI(QMainWindow):
         
         # Hover Logic (Cursor Shape)
         if self.tool_mode == 'select':
-             if track and track.track_type == 'vocal' and track.f0_edited is not None and self.selection_mask is not None:
+             if track and track.track_type == 'vocal' and self.selection_mask is not None:
+                 sel_param = self.selection_param or getattr(self, 'edit_param', 'pitch')
+                 arr = self.get_param_array(track, sel_param)
+                 curve_y = self.get_param_curve_y(track, sel_param)
+                 if arr is None or curve_y is None:
+                     self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
+                     return
+
+
                  x = int(mouse_point.x()) - track.start_frame
                  if 0 <= x < len(self.selection_mask) and self.selection_mask[x]:
                      y = mouse_point.y()
-                     if abs(y - track.f0_edited[x]) < 3.0: # Tolerance
+                     if abs(y - curve_y[x]) < 3.0: # Tolerance
                          self.plot_widget.setCursor(Qt.CursorShape.OpenHandCursor)
                      else:
                          self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1484,6 +1946,7 @@ class HifiShifterGUI(QMainWindow):
                      self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
              else:
                  self.plot_widget.setCursor(Qt.CursorShape.ArrowCursor)
+
 
     def on_viewbox_mouse_press(self, ev):
         track = self.current_track
@@ -1507,25 +1970,35 @@ class HifiShifterGUI(QMainWindow):
                 self.move_start_x = mouse_point.x()
                 self.move_start_frame = track.start_frame
                 self.plot_widget.setCursor(Qt.CursorShape.ClosedHandCursor)
-            elif self.tool_mode == 'draw' and track.track_type == 'vocal' and track.f0_edited is not None:
+            elif self.tool_mode == 'draw' and track.track_type == 'vocal' and (track.f0_edited is not None or getattr(track, 'tension_edited', None) is not None):
                 self.last_mouse_pos = None
                 self.handle_draw(mouse_point, is_left, is_right)
-            elif self.tool_mode == 'select' and is_left and track.track_type == 'vocal' and track.f0_edited is not None:
+
+            elif self.tool_mode == 'select' and is_left and track.track_type == 'vocal':
+                sel_param = self.selection_param or getattr(self, 'edit_param', 'pitch')
+                arr = self.get_param_array(track, sel_param)
+                curve_y = self.get_param_curve_y(track, sel_param)
+                if arr is None or curve_y is None:
+                    return
+
+
                 # Check if clicking inside existing selection
                 x = int(mouse_point.x()) - track.start_frame
                 is_inside_selection = False
                 if self.selection_mask is not None and 0 <= x < len(self.selection_mask):
                     if self.selection_mask[x]:
-                        # Check Y proximity
                         y = mouse_point.y()
-                        if abs(y - track.f0_edited[x]) < 3.0:
+                        if abs(y - curve_y[x]) < 3.0:
                             is_inside_selection = True
-                
+
                 if is_inside_selection:
                     # Start Dragging Selection
                     self.is_dragging_selection = True
                     self.drag_start_pos = mouse_point
-                    self.drag_start_f0 = track.f0_edited.copy()
+                    self.drag_param = sel_param
+
+                    self.drag_start_values = arr.copy()
+                    self.drag_start_f0 = track.f0_edited.copy() if getattr(track, 'f0_edited', None) is not None else None
                     self.push_undo() # Push undo before drag starts
                     self.plot_widget.setCursor(Qt.CursorShape.ClosedHandCursor)
                 else:
@@ -1534,43 +2007,103 @@ class HifiShifterGUI(QMainWindow):
                     self.selection_start_pos = mouse_point
                     self.selection_box_item.setRect(QRectF(mouse_point, mouse_point))
                     self.selection_box_item.setVisible(True)
-                    # Clear previous selection
-                    self.selection_mask = None
+                    self.set_selection(None)
+
                     self.update_plot()
                     self.status_label.setText("开始框选...")
 
+
+
     def handle_draw(self, point, is_left, is_right):
         track = self.current_track
-        if not track or track.track_type != 'vocal' or track.f0_edited is None:
+        if not track or track.track_type != 'vocal':
             return
 
         # Adjust x by start_frame
         x = int(point.x()) - track.start_frame
         y = point.y()
-        
+
         # Start of a new stroke?
         if self.last_mouse_pos is None:
             self.push_undo()
-        
+
+        edit_param = getattr(self, 'edit_param', 'pitch')
+
+        # ---- Tension drawing (stored in [-100, 100], displayed on pitch axis via mapping) ----
+        if edit_param == 'tension':
+            tension = getattr(track, 'tension_edited', None)
+            if tension is None:
+                return
+
+            v = self.plot_y_to_tension(y)
+            changed = False
+            affected_range = (x, x)
+
+            if 0 <= x < len(tension):
+                if self.last_mouse_pos is not None:
+                    last_x, last_v = self.last_mouse_pos
+
+                    start_x, end_x = sorted((last_x, x))
+                    start_x = max(0, start_x)
+                    end_x = min(len(tension) - 1, end_x)
+                    affected_range = (start_x, end_x)
+
+                    if start_x < end_x:
+                        for i in range(start_x, end_x + 1):
+                            if is_left:
+                                ratio = (i - last_x) / (x - last_x) if x != last_x else 0
+                                interp_v = last_v + ratio * (v - last_v)
+                                tension[i] = interp_v
+                                changed = True
+                            elif is_right:
+                                tension[i] = 0.0
+                                changed = True
+                    else:
+                        if is_left:
+                            tension[x] = v
+                            changed = True
+                        elif is_right:
+                            tension[x] = 0.0
+                            changed = True
+                else:
+                    if is_left:
+                        tension[x] = v
+                        changed = True
+                    elif is_right:
+                        tension[x] = 0.0
+                        changed = True
+
+                self.last_mouse_pos = (x, v)
+                self.update_plot()
+
+                if changed:
+                    track.tension_version += 1
+                    track._tension_processed_audio = None
+                    track._tension_processed_key = None
+                    self.is_dirty = True
+                    self.status_label.setText("张力已修改 (导出/播放时生效)")
+
+            return
+
+        # ---- Pitch drawing (existing behavior) ----
+        if track.f0_edited is None:
+            return
+
         changed = False
         affected_range = (x, x) # Track min/max x affected
-        
+
         f0 = track.f0_edited
         f0_orig = track.f0_original
-        
+
         if 0 <= x < len(f0):
             if self.last_mouse_pos is not None:
                 last_x, last_y = self.last_mouse_pos
-                # Adjust last_x as well? No, last_mouse_pos stores the *index* in f0, not screen coord?
-                # Wait, last_mouse_pos was storing (x, y) where x was int(point.x()).
-                # So last_mouse_pos was screen coordinates (frames).
-                # If I change x to be relative index, I should store relative index in last_mouse_pos too.
-                
+
                 start_x, end_x = sorted((last_x, x))
                 start_x = max(0, start_x)
                 end_x = min(len(f0) - 1, end_x)
                 affected_range = (start_x, end_x)
-                
+
                 if start_x < end_x:
                     for i in range(start_x, end_x + 1):
                         if is_left:
@@ -1596,21 +2129,21 @@ class HifiShifterGUI(QMainWindow):
                 elif is_right and f0_orig is not None:
                     f0[x] = f0_orig[x]
                     changed = True
-            
+
             if changed:
                 # Mark affected segments as dirty
                 min_x, max_x = affected_range
                 for i, (seg_start, seg_end) in enumerate(track.segments):
-                    # Check overlap
                     if not (max_x < seg_start or min_x >= seg_end):
                         track.segment_states[i]['dirty'] = True
-            
+
             self.last_mouse_pos = (x, y) # Store relative index
             self.update_plot()
-            
+
             if changed:
                 self.is_dirty = True
                 self.status_label.setText("音高已修改 (未合成)")
+
     
     def mouseReleaseEvent(self, ev):
         if self.tool_mode == 'move':
