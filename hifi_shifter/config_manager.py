@@ -56,3 +56,16 @@ def set_theme(theme_name):
     config = load_config()
     config['theme'] = theme_name
     save_config(config)
+
+
+def get_synthesis_engine():
+    """Get preferred synthesis engine (hifigan | vslib)."""
+    config = load_config()
+    return config.get('synthesis_engine', 'hifigan')
+
+
+def set_synthesis_engine(engine_name):
+    """Persist preferred synthesis engine."""
+    config = load_config()
+    config['synthesis_engine'] = engine_name
+    save_config(config)

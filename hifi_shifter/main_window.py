@@ -90,6 +90,12 @@ class HifiShifterGUI(QMainWindow):
         
         # Initialize Audio Processor
         self.processor = AudioProcessor()
+
+        # Synthesis engine options
+        self.engine_options = [
+            ('hifigan', i18n.get("algorithm.hifigan")),
+            ('vslib', i18n.get("algorithm.vslib")),
+        ]
         
         # Data for UI
         self.project_path = None
@@ -149,6 +155,7 @@ class HifiShifterGUI(QMainWindow):
         self.last_mouse_pos = None
         
         self.init_ui()
+        self._apply_engine_selection(config_manager.get_synthesis_engine(), persist=False, quiet=True)
         self.load_default_model()
         
     def _set_dirty(self, dirty: bool = True):
@@ -323,6 +330,13 @@ class HifiShifterGUI(QMainWindow):
         self.param_combo.setCurrentIndex(0)
         self.param_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.param_combo.currentIndexChanged.connect(self.on_param_changed)
+
+        # Synthesis engine selector
+        self.engine_combo = QComboBox()
+        for eng_id, eng_label in self.engine_options:
+            self.engine_combo.addItem(eng_label, userData=eng_id)
+        self.engine_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
         
         # Tab Shortcut for Mode Toggle
 
@@ -357,6 +371,8 @@ class HifiShifterGUI(QMainWindow):
         controls_layout.addWidget(self.mode_combo)
         controls_layout.addWidget(QLabel(i18n.get("label.edit_param") + ":"))
         controls_layout.addWidget(self.param_combo)
+        controls_layout.addWidget(QLabel(i18n.get("label.algorithm") + ":"))
+        controls_layout.addWidget(self.engine_combo)
         controls_layout.addWidget(QLabel(i18n.get("label.params") + ":"))
         controls_layout.addWidget(self.bpm_spin)
 
@@ -580,6 +596,67 @@ class HifiShifterGUI(QMainWindow):
         # Set initial cursor and status text
         self.on_mode_changed(self.mode_combo.currentIndex())
         status_layout.addStretch()
+
+    def _engine_label(self, eng_id: str) -> str:
+        for eid, label in self.engine_options:
+            if eid == eng_id:
+                return label
+        return eng_id
+
+    def _set_engine_combo_value(self, eng_id: str):
+        if not hasattr(self, 'engine_combo'):
+            return
+        for idx, (eid, _) in enumerate(self.engine_options):
+            if eid == eng_id:
+                self.engine_combo.blockSignals(True)
+                self.engine_combo.setCurrentIndex(idx)
+                self.engine_combo.blockSignals(False)
+                return
+
+    def _mark_all_vocal_segments_dirty(self):
+        for track in self.tracks:
+            if getattr(track, 'track_type', None) != 'vocal':
+                continue
+            track.synthesized_audio = None
+            for state in getattr(track, 'segment_states', []) or []:
+                state['dirty'] = True
+
+    def _apply_engine_selection(self, engine_name: str, *, persist: bool = True, quiet: bool = False):
+        eng = (engine_name or 'hifigan').lower()
+        if eng not in ('hifigan', 'vslib'):
+            eng = 'hifigan'
+
+        if eng == 'vslib':
+            status = self.processor.vslib_status()
+            if not status.available:
+                if not quiet:
+                    QMessageBox.warning(
+                        self,
+                        i18n.get("msg.warning"),
+                        i18n.get("msg.vslib_missing").format(status.error or "unknown"),
+                    )
+                    try:
+                        self.status_label.setText(i18n.get("status.vslib_unavailable"))
+                    except Exception:
+                        pass
+                eng = 'hifigan'
+
+        self.processor.synthesis_engine = eng
+        if persist:
+            config_manager.set_synthesis_engine(eng)
+
+        self._set_engine_combo_value(eng)
+        self._mark_all_vocal_segments_dirty()
+
+        if not quiet:
+            try:
+                self.status_label.setText(i18n.get("status.algorithm_changed").format(self._engine_label(eng)))
+            except Exception:
+                pass
+
+    def on_engine_changed(self, index):
+        eng = self.engine_combo.itemData(index)
+        self._apply_engine_selection(eng, persist=True)
 
     def on_grid_changed(self, index):
         resolutions = [4, 8, 16, 32]
@@ -983,10 +1060,16 @@ class HifiShifterGUI(QMainWindow):
 
         def _fail(_err_text: str):
             self.status_label.setText(i18n.get("status.auto_synthesis_failed"))
+            try:
+                if _err_text:
+                    QMessageBox.critical(self, i18n.get("msg.error"), _err_text)
+            except Exception:
+                pass
 
+        status_key = "status.synthesizing_vslib" if getattr(self.processor, 'synthesis_engine', 'hifigan') == 'vslib' else "status.synthesizing"
         self._start_bg_task(
             kind='synthesize',
-            status_text=i18n.get("status.synthesizing"),
+            status_text=i18n.get(status_key),
             fn=_work,
             total=total_segments,
             on_success=_ok,
@@ -1809,6 +1892,7 @@ class HifiShifterGUI(QMainWindow):
                     loaded_model_path = model_path
 
             params = data.get('params', {}) if isinstance(data, dict) else {}
+            engine_name = data.get('synthesis_engine', params.get('synthesis_engine', 'hifigan'))
 
             tracks: list[Track] = []
             missing_audio: list[str] = []
@@ -1894,6 +1978,7 @@ class HifiShifterGUI(QMainWindow):
                 'data': data,
                 'loaded_model_path': loaded_model_path,
                 'params': params,
+                'engine': engine_name,
                 'tracks': tracks,
                 'missing_audio': missing_audio,
             }
@@ -1914,6 +1999,9 @@ class HifiShifterGUI(QMainWindow):
                 self.bpm_spin.setValue(params['bpm'])
             if 'beats' in params:
                 self.beats_spin.setValue(params['beats'])
+
+            eng = result.get('engine') or config_manager.get_synthesis_engine()
+            self._apply_engine_selection(eng, persist=False, quiet=False)
 
             self.tracks = result.get('tracks', []) or []
 
@@ -2007,8 +2095,9 @@ class HifiShifterGUI(QMainWindow):
                     model_path_save = self.model_path
 
             data = {
-                'version': '2.1',
+                'version': '2.2',
                 'model_path': model_path_save,
+                'synthesis_engine': getattr(self.processor, 'synthesis_engine', 'hifigan'),
                 'params': {
                     'bpm': self.bpm_spin.value(),
                     'beats': self.beats_spin.value()

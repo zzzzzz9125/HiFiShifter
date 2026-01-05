@@ -1,8 +1,11 @@
 import json
+import os
 import pathlib
+import tempfile
 
 import numpy as np
 import torch
+import scipy.io.wavfile as wavfile
 
 from .audio_processing._bootstrap import ensure_project_root_on_sys_path
 
@@ -17,6 +20,12 @@ from .audio_processing.hifigan_infer import (
     synthesize_segment_with_padding,
 )
 from .audio_processing.tension_fx import apply_tension_tilt_pd
+from .audio_processing.vslib_engine import (
+    VslibEngine,
+    VslibError,
+    VslibStatus,
+    VslibUnavailableError,
+)
 
 
 
@@ -32,6 +41,8 @@ class AudioProcessor:
         self.model = None
         self.config: dict = {}
         self.mel_transform = None
+        self.synthesis_engine = 'hifigan'
+        self._vslib_engine: VslibEngine | None = None
 
     def load_model(self, folder_path):
         """Load model and configuration from the specified folder."""
@@ -158,3 +169,62 @@ class AudioProcessor:
             f0_midi,
             device=self.device,
         )
+
+    def _get_vslib_engine(self) -> VslibEngine:
+        if self._vslib_engine is None:
+            self._vslib_engine = VslibEngine()
+        return self._vslib_engine
+
+    def vslib_status(self) -> VslibStatus:
+        """Return VSLIB availability and dll path without raising."""
+        try:
+            engine = self._get_vslib_engine()
+            return engine.status
+        except VslibUnavailableError as exc:
+            return VslibStatus(False, None, exc.reason)
+
+    def synthesize_full_vslib(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        f0_midi_original: np.ndarray,
+        f0_midi_edited: np.ndarray,
+    ) -> np.ndarray:
+        """Synthesize audio with VSLIB using edited MIDI F0 while preserving consonants.
+
+        We map user edits onto VSLIB control points. If a control point has no
+        pitch change (original == edited within tolerance), we keep VSLIB's
+        original pitch flags to avoid over-processing consonants.
+        """
+        if audio is None or f0_midi_edited is None:
+            raise RuntimeError("缺少音频或音高数据，无法使用 VSLIB 合成")
+
+        engine = self._get_vslib_engine()
+        hop_size = int(self.config.get('hop_size', 512)) if self.config else 512
+
+        audio_f = np.asarray(audio, dtype=np.float32)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.wav', prefix='hifishifter_vslib_')
+        os.close(tmp_fd)
+        tmp_file = pathlib.Path(tmp_path)
+
+        try:
+            wav_int16 = (np.clip(audio_f, -1.0, 1.0) * 32767.0).astype(np.int16)
+            wavfile.write(tmp_file, int(sample_rate), wav_int16)
+
+            return engine.synthesize_from_pitch(
+                tmp_file,
+                f0_midi_original,
+                f0_midi_edited,
+                sample_rate=int(sample_rate),
+                hop_size=hop_size,
+            )
+        except VslibError as exc:
+            if exc.code == 6:
+                # VSERR_FREQ: guide users to resample when VSLIB rejects current spec
+                raise RuntimeError("VSLIB 不支持当前采样率或格式，请先转换为 44100Hz 16-bit WAV 再试。") from exc
+            raise
+        finally:
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass

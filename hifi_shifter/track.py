@@ -103,6 +103,27 @@ class Track:
         if not self.segment_states[segment_idx]['dirty']:
             return
 
+        if getattr(processor, 'synthesis_engine', 'hifigan') == 'vslib':
+            # For vslib, synthesize the entire track once to avoid repeated DLL calls
+            hop_size = int(processor.config.get('hop_size', 512)) if processor.config else 512
+            full_audio = processor.synthesize_full_vslib(
+                self.audio,
+                self.sr,
+                self.f0_original,
+                self.f0_edited,
+            )
+            self.synthesized_audio = full_audio
+            for i, (s, e) in enumerate(self.segments):
+                expected_len = (e - s) * hop_size
+                start_sample = s * hop_size
+                end_sample = start_sample + expected_len
+                seg_audio = full_audio[start_sample:end_sample]
+                if len(seg_audio) < expected_len:
+                    seg_audio = np.pad(seg_audio, (0, expected_len - len(seg_audio)), constant_values=0.0)
+                self.segment_states[i]['audio'] = seg_audio.astype(np.float32)
+                self.segment_states[i]['dirty'] = False
+            return
+
         start, end = self.segments[segment_idx]
         f0_segment = self.f0_edited[start:end]
         

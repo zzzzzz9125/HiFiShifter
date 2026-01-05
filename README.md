@@ -54,6 +54,12 @@ python run_gui.py
 - 编辑区内也提供参数切换按钮（与顶部下拉框保持同步）。
 - 点击 `播放` -> `合成并播放` 听取效果。
 
+### 合成引擎选择
+
+- 顶部“合成引擎”下拉框可在 **Neural (HiFiGAN)** 与 **VocalShifter (VSLIB)** 间切换。
+- VSLIB 仅在 Windows 上可用，使用仓库内 `vslib/vslib_x64.dll`（64 位）或 `vslib.dll`。
+- 若 VSLIB 提示采样率不支持，请先将音频转换为 **44.1kHz 16-bit WAV** 再重试。
+
 ## 编辑模式与选区模式
 
 ### 编辑模式（Edit）
